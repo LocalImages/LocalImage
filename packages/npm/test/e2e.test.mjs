@@ -44,12 +44,16 @@ t('read-only view cannot control the browser or reach CDP', async () => {
   try {
     const v = new URL(s.viewUrl);
     const c = new URL(s.liveUrl);
-    const login = async (base, usr, pwd) =>
-      (await fetch(base + 'api/login', {
+    const login = async (base, usr, pwd) => {
+      const res = await fetch(base + 'api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: usr, password: pwd }),
-      })).json();
+      });
+      const text = await res.text();
+      assert.ok(res.ok, `login as ${usr} at ${base}: HTTP ${res.status}, body: ${JSON.stringify(text.slice(0, 200))}`);
+      return JSON.parse(text);
+    };
 
     const viewer = await login(v.origin + v.pathname, 'viewer', v.searchParams.get('pwd'));
     const ctl = await login(c.origin + c.pathname, 'controller', c.searchParams.get('pwd'));

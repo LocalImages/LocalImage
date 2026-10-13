@@ -393,35 +393,53 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	return rec, nil
 }
 
+// waitReady blocks until the session is usable: the browser's automation
+// endpoint answers and Neko's web server (the live view) is serving.
 func waitReady(ctx context.Context, rec *Record, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+
+	// Docker's port publisher accepts TCP before the service inside is up, so
+	// a dial proves nothing: require an actual HTTP response. The Playwright
+	// server answers a plain GET with a non-200 status, which still means it
+	// is listening.
 	addr := "127.0.0.1:" + rec.BackendPort
-	path := "/json/version"
+	path, anyStatus := "/json/version", false
 	if rec.Protocol == ProtocolPlaywright {
-		path = "/pw"
+		path, anyStatus = "/pw", true
 	}
+	if !pollHTTP(ctx, "http://"+addr+path, deadline, anyStatus) {
+		return fmt.Errorf("browser did not become ready within %s", timeout)
+	}
+	// Neko starts alongside the browser and can lag behind it, particularly on
+	// a slow machine; a live view URL handed out too early would fail.
+	web := "http://127.0.0.1:" + rec.WebPort + "/t/" + rec.Token + "/live/health"
+	if !pollHTTP(ctx, web, deadline, false) {
+		return fmt.Errorf("live view did not become ready within %s", timeout)
+	}
+	if len(rec.Extensions) > 0 {
+		waitExtensionTarget(ctx, addr)
+	}
+	return nil
+}
+
+// pollHTTP GETs url every 250ms until it answers (any status if anyStatus,
+// otherwise 200), the deadline passes, or ctx ends.
+func pollHTTP(ctx context.Context, url string, deadline time.Time, anyStatus bool) bool {
 	for time.Now().Before(deadline) {
-		// Docker's port publisher accepts TCP before the service inside is up,
-		// so a dial proves nothing: require an actual HTTP response. The
-		// Playwright server answers a plain GET with a non-200 status, which
-		// still means it is listening.
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+path, nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if resp, err := http.DefaultClient.Do(req); err == nil {
 			resp.Body.Close()
-			if rec.Protocol == ProtocolPlaywright || resp.StatusCode == http.StatusOK {
-				if len(rec.Extensions) > 0 {
-					waitExtensionTarget(ctx, addr)
-				}
-				return nil
+			if anyStatus || resp.StatusCode == http.StatusOK {
+				return true
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+			return false
+		case <-time.After(250 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("browser did not become ready within %s", timeout)
+	return false
 }
 
 func (m *Manager) findContainer(ctx context.Context, label string) (string, error) {
