@@ -88,7 +88,15 @@ jobs:
           CHROME_PATH: /usr/bin/google-chrome
         run: |
           npm install
+          npm run test:types
           npm test
+      - name: Run Python SDK end-to-end tests
+        working-directory: packages/python
+        env:
+          PYTHONPATH: src
+        run: python3 -m unittest discover -s tests -v
       - name: Daemon log
         if: failure()
-        run: cat daemon.log
+        run: |
+          cat daemon.log
+          cat /tmp/localimage-daemon-*.log 2>/dev/null || true

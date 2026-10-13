@@ -54,17 +54,48 @@ func main() {
 		memory := fs.Int("memory", 0, "memory limit in MiB")
 		cpus := fs.Float64("cpus", 0, "CPU limit")
 		kiosk := fs.Bool("kiosk", false, "chromium: fullscreen without tabs or address bar")
-		var exts stringList
+		wait := fs.Int("wait", 0, "seconds to queue for a free session slot (0 = fail at once)")
+		noBuild := fs.Bool("no-build", false, "fail with image_not_ready instead of building a missing browser image")
+		var exts, tags stringList
 		fs.Var(&exts, "extension", "chromium: uploaded extension to load (repeatable)")
+		fs.Var(&tags, "tag", "key=value metadata, usable to filter `ls` (repeatable)")
 		fs.Parse(os.Args[2:])
+		tagMap := map[string]string{}
+		for _, t := range tags {
+			k, v, ok := strings.Cut(t, "=")
+			if !ok || k == "" {
+				fmt.Fprintf(os.Stderr, "localimage: -tag expects key=value, got %q\n", t)
+				os.Exit(2)
+			}
+			tagMap[k] = v
+		}
 		body, _ := json.Marshal(map[string]any{
 			"browser": *browser, "ttl_seconds": *ttl,
 			"profile": *profile, "memory_mb": *memory, "cpus": *cpus,
 			"kiosk": *kiosk, "extensions": []string(exts),
+			"tags": tagMap, "wait_seconds": *wait, "no_build": *noBuild,
 		})
 		call(addr, http.MethodPost, "/v1/sessions", body)
 	case "ls":
-		call(addr, http.MethodGet, "/v1/sessions", nil)
+		fs := flag.NewFlagSet("ls", flag.ExitOnError)
+		var tags stringList
+		fs.Var(&tags, "tag", "only sessions with this key=value tag (repeatable)")
+		fs.Parse(os.Args[2:])
+		q := url.Values{}
+		for _, t := range tags {
+			q.Add("tag", t)
+		}
+		path := "/v1/sessions"
+		if len(q) > 0 {
+			path += "?" + q.Encode()
+		}
+		call(addr, http.MethodGet, path, nil)
+	case "info":
+		call(addr, http.MethodGet, "/v1/info", nil)
+	case "pull", "prepare":
+		pull(addr, os.Args[2:])
+	case "stop":
+		call(addr, http.MethodPost, "/v1/shutdown", nil)
 	case "exec":
 		// localimage exec <id> -- <command> [args...]
 		if len(os.Args) < 5 || os.Args[3] != "--" {
@@ -108,14 +139,19 @@ Usage: localimage <command> [arguments]
 
 Daemon
   start [-addr host:port]      run the daemon (default 127.0.0.1:7777)
+  stop                         stop the daemon (sessions keep running until their TTL)
+  pull [chromium|firefox ...]  build the browser images now (default: chromium), so no session has to
   doctor                       check Docker, images and the daemon
 
 Sessions
   create [flags]               start a browser session and print its URLs
       -browser chromium|firefox   -ttl seconds   -profile name (chromium)
       -extension name (repeatable, chromium)   -kiosk (chromium)
-      -memory MiB   -cpus n
-  ls                           list running sessions
+      -memory MiB   -cpus n   -tag key=value (repeatable)
+      -wait seconds           queue for a free slot instead of failing at once
+      -no-build               fail with image_not_ready instead of building a missing image
+  ls [-tag key=value ...]      list sessions (all states), optionally filtered by tag
+  info                         show the daemon's version, limits and current load
   rm <id>                      delete a session
   exec <id> -- <cmd...>        run a command inside the session
   screenshot <id> [-o file]    save a PNG of the display
@@ -209,7 +245,7 @@ func start(addr string) {
 	defer stop()
 	go api.RunReaper(ctx, mgr)
 
-	srv := &http.Server{Addr: addr, Handler: api.New(mgr, os.Getenv("LOCALIMAGE_API_KEY")).Handler()}
+	srv := &http.Server{Addr: addr, Handler: api.New(mgr, os.Getenv("LOCALIMAGE_API_KEY"), version, stop).Handler()}
 	go func() {
 		<-ctx.Done()
 		sh, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -353,4 +389,48 @@ func zipSource(p string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// pull builds the browser images ahead of time, printing progress as it goes.
+func pull(addr string, browsers []string) {
+	body, _ := json.Marshal(map[string]any{"browsers": browsers})
+	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/images/prepare", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if k := os.Getenv("LOCALIMAGE_API_KEY"); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "daemon not reachable (run `localimage start`):", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "%s\n", b)
+		os.Exit(1)
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var ev struct {
+			Event, Browser, Message, Error, Code string
+			Images                               map[string]string
+		}
+		if err := dec.Decode(&ev); err != nil {
+			fmt.Fprintln(os.Stderr, "the daemon closed the connection before the build finished")
+			os.Exit(1)
+		}
+		switch ev.Event {
+		case "progress":
+			fmt.Printf("[%s] %s\n", ev.Browser, ev.Message)
+		case "error":
+			fmt.Fprintf(os.Stderr, "failed (%s): %s\n", ev.Code, ev.Error)
+			os.Exit(1)
+		case "done":
+			for b, st := range ev.Images {
+				fmt.Printf("%s: %s\n", b, st)
+			}
+			return
+		}
+	}
 }

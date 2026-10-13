@@ -9,13 +9,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 
 	"github.com/docker/docker/api/types/build"
 )
 
 // buildImage builds assets/<name> into the local Docker image `tag`. It runs
 // once per machine; later sessions reuse the cached image.
-func (m *Manager) buildImage(ctx context.Context, name, tag string) error {
+func (m *Manager) buildImage(ctx context.Context, name, tag string, onLog func(string)) error {
 	root := "assets/" + name
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -66,6 +67,18 @@ func (m *Manager) buildImage(ctx context.Context, name, tag string) error {
 		}
 		if msg.Error != "" {
 			return fmt.Errorf("image build failed: %s", msg.Error)
+		}
+		if onLog != nil {
+			// Only the step headlines: the full apt output is thousands of lines.
+			for _, line := range strings.Split(msg.Stream, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "Step ") || strings.HasPrefix(line, "Successfully") {
+					if len(line) > 160 {
+						line = line[:160] + "..."
+					}
+					onLog(line)
+				}
+			}
 		}
 	}
 }

@@ -13,6 +13,8 @@ RUN npm init -y >/dev/null \
  && chmod -R a+rX /opt/pw-browsers
 COPY server.mjs /opt/pw/server.mjs
 COPY pw.conf /etc/neko/supervisord/pw.conf
+COPY openbox.xml /etc/neko/openbox.xml
+RUN mkdir -p /home/neko/Downloads && chown neko:neko /home/neko/Downloads
 
 # Neko's stock check hits /health at the root, but sessions serve everything
 # under a per-session path prefix (NEKO_SERVER_PATH_PREFIX), so it always failed.

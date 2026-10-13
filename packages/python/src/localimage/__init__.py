@@ -1,12 +1,128 @@
 import json
 import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
+
+from ._binary import find_binary, make_executable
 
 DEFAULT_ADDR = os.environ.get("LOCALIMAGE_ADDR", "127.0.0.1:7777")
+_DEFAULT = object()  # "use the client's default timeout"
+
+
+class LocalImageError(RuntimeError):
+    """Every failure is a LocalImageError with a stable ``code``, so callers can branch without
+    parsing messages. Codes from the daemon:
+
+    - ``session_gone``: the session does not exist (already deleted, expired, never created)
+    - ``limit_exceeded``: too many sessions, or a ttl over the limit; ``details`` has max/running
+    - ``invalid_request``: malformed request, or it names something that does not exist
+    - ``conflict``: clashes with current state (for example a profile already in use)
+    - ``image_not_ready``: ``no_build`` was set and the browser image is not built (see prepare())
+    - ``unauthorized``: missing or wrong API key
+    - ``docker_unavailable``: the daemon cannot reach Docker
+    - ``not_found``, ``internal``
+
+    Codes raised by this SDK:
+
+    - ``request_timeout``: the call exceeded its ``timeout``
+    - ``daemon_unreachable``: nothing is listening at the daemon address
+    - ``daemon_start_failed``: ensure_daemon could not start the daemon (the message has its log)
+    - ``binary_not_found``: there is no localimage binary
+    """
+
+    def __init__(self, message: str, code: str = "internal", status: Optional[int] = None,
+                 details: Optional[dict] = None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.details = details
+
+
+def _healthy(addr: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{addr}/healthz", timeout=1.5) as r:
+            return r.status == 200
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_daemon(addr: str = DEFAULT_ADDR, api_key: Optional[str] = None, env: Optional[dict] = None,
+                  timeout: float = 30.0, log_file: Optional[str] = None) -> dict:
+    """Make sure a daemon is running at ``addr``, starting one if needed, and wait until it answers.
+
+    An already-running daemon is reused. A daemon started here is detached and keeps running after
+    this process exits, so parallel workers and later runs share it.
+
+    Returns ``{"started": bool, "addr": str, "pid": int, "log_file": str}`` (the last two only when
+    started). Raises ``LocalImageError`` with ``daemon_start_failed``, ``docker_unavailable`` (the
+    daemon could not reach Docker) or ``binary_not_found``. ``env`` is passed to a daemon started
+    here, for example ``{"LOCALIMAGE_MAX_SESSIONS": "20"}``; it does not affect a running one.
+    """
+    if _healthy(addr):
+        return {"started": False, "addr": addr}
+
+    binary = find_binary()
+    if not binary:
+        raise LocalImageError("no localimage binary found; install a platform wheel or set LOCALIMAGE_BIN",
+                              code="binary_not_found")
+    make_executable(binary)
+
+    log = log_file or os.path.join(
+        tempfile.gettempdir(), "localimage-daemon-" + "".join(c if c.isalnum() or c in ".-" else "_" for c in addr) + ".log")
+    child_env = {**os.environ, **(env or {})}
+    if api_key:
+        child_env["LOCALIMAGE_API_KEY"] = api_key
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    with open(log, "ab") as out:
+        try:
+            proc = subprocess.Popen([binary, "start", "-addr", addr], stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=out, env=child_env, **kwargs)
+        except OSError as e:
+            raise LocalImageError(f"could not run {binary}: {e}", code="daemon_start_failed") from None
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _healthy(addr):
+            # The daemon is detached on purpose: stop Popen from warning when it is collected.
+            proc.returncode = 0
+            return {"started": True, "addr": addr, "pid": proc.pid, "log_file": log}
+        if proc.poll() is not None:
+            # Our process exited. If another process started a daemon at the same moment, that
+            # one answers; otherwise this really failed.
+            time.sleep(0.3)
+            if _healthy(addr):
+                return {"started": False, "addr": addr}
+            break
+        time.sleep(0.1)
+
+    if proc.poll() is None:  # never became healthy: do not leave it running
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    try:
+        with open(log, "r", errors="replace") as f:
+            tail = "\n".join(f.read().strip().splitlines()[-6:])
+    except OSError:
+        tail = ""
+    docker_down = "cannot reach docker" in tail.lower()
+    raise LocalImageError(
+        f"{'Docker is not available' if docker_down else 'the localimage daemon did not start'} "
+        f"at {addr} (log {log})" + (f":\n{tail}" if tail else ""),
+        code="docker_unavailable" if docker_down else "daemon_start_failed")
 
 
 @dataclass
@@ -19,6 +135,8 @@ class Session:
     view_url: str  # read-only: watch only
     profile: Optional[str]
     extensions: list
+    tags: dict
+    downloads_dir: str  # where the browser saves downloads; read files with download_file()
     expires_at: str
     _client: "LocalImage"
 
@@ -88,8 +206,9 @@ class Session:
         q = urllib.parse.urlencode({"path": path})
         return self._client._call("GET", f"/v1/sessions/{self.id}/files/list?{q}")
 
-    def close(self) -> None:
-        self._client.delete(self.id)
+    def close(self) -> bool:
+        """Delete the session. Safe to call more than once; True if this call removed it."""
+        return self._client.delete(self.id)
 
     def __enter__(self) -> "Session":
         return self
@@ -99,12 +218,33 @@ class Session:
 
 
 class LocalImage:
-    def __init__(self, addr: str = DEFAULT_ADDR, api_key: Optional[str] = None):
+    """Client for the localimage daemon.
+
+    ``auto_start`` starts the daemon on the first call if none is running (default: on when
+    ``LOCALIMAGE_AUTOSTART=1``); ``daemon_env`` is the environment for a daemon started that way.
+    """
+
+    def __init__(self, addr: str = DEFAULT_ADDR, api_key: Optional[str] = None,
+                 auto_start: Optional[bool] = None, daemon_env: Optional[dict] = None,
+                 timeout: Optional[float] = 300.0):
+        # `timeout` is the default for ordinary calls; it limits how long the connection may stay
+        # silent. create() and prepare() default to no limit, since a first-run image build is one
+        # long request. Pass timeout= to any of them to override.
+        self.timeout = timeout
         self.addr = addr
         self.api_key = api_key or os.environ.get("LOCALIMAGE_API_KEY")
+        self.auto_start = (os.environ.get("LOCALIMAGE_AUTOSTART") == "1") if auto_start is None else auto_start
+        self.daemon_env = daemon_env or {}
+        self._start_lock = threading.Lock()
 
-    def _open(self, method: str, path: str, body: Optional[dict] = None,
-              data: Optional[bytes] = None) -> bytes:
+    def ensure_daemon(self, **kwargs) -> dict:
+        """Start the daemon if it is not running (see the module-level ensure_daemon)."""
+        kwargs.setdefault("env", self.daemon_env)
+        return ensure_daemon(addr=self.addr, api_key=self.api_key, **kwargs)
+
+    def _open_once(self, method: str, path: str, body: Optional[dict] = None,
+                   data: Optional[bytes] = None, timeout=_DEFAULT) -> bytes:
+        timeout = self.timeout if timeout is _DEFAULT else timeout
         if data is None and body is not None:
             data = json.dumps(body).encode()
         req = urllib.request.Request(
@@ -114,36 +254,171 @@ class LocalImage:
                      **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})},
         )
         try:
-            with urllib.request.urlopen(req, timeout=300) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
-            msg = json.loads(e.read() or b"{}").get("error", f"HTTP {e.code}")
-            raise RuntimeError(msg) from None
+            try:
+                b = json.loads(e.read() or b"{}")
+            except ValueError:
+                b = {}
+            finally:
+                e.close()
+            raise LocalImageError(b.get("error", f"HTTP {e.code}"), code=b.get("code", f"http_{e.code}"),
+                                  status=e.code, details=b.get("details")) from None
         except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"localimage daemon not reachable at {self.addr}; run `localimage start` ({e.reason})"
-            ) from None
+            if isinstance(e.reason, TimeoutError):
+                raise LocalImageError(f"{method} {path} did not answer within {timeout} s",
+                                      code="request_timeout") from None
+            raise LocalImageError(
+                f"localimage daemon not reachable at {self.addr}; start it with `localimage start`, "
+                f"or use ensure_daemon() / auto_start ({e.reason})", code="daemon_unreachable") from None
+        except TimeoutError:
+            raise LocalImageError(f"{method} {path} did not answer within {timeout} s",
+                                  code="request_timeout") from None
 
-    def _call(self, method: str, path: str, body: Optional[dict] = None):
-        raw = self._open(method, path, body)
+    def _open(self, method: str, path: str, body: Optional[dict] = None,
+              data: Optional[bytes] = None, timeout=_DEFAULT) -> bytes:
+        try:
+            return self._open_once(method, path, body, data, timeout)
+        except LocalImageError as e:
+            if e.code != "daemon_unreachable" or not self.auto_start:
+                raise
+            with self._start_lock:  # concurrent threads share one start-up
+                self.ensure_daemon()
+            return self._open_once(method, path, body, data, timeout)
+
+    def _call(self, method: str, path: str, body: Optional[dict] = None, timeout=_DEFAULT):
+        raw = self._open(method, path, body, timeout=timeout)
         return json.loads(raw) if raw else None
 
     def _raw(self, method: str, path: str) -> bytes:
         return self._open(method, path)
 
+    def prepare(self, browsers: Optional[list] = None, on_progress=None, timeout: Optional[float] = None) -> dict:
+        """Build the browser images that are missing, so the first session does not have to.
+
+        The first Chromium launch builds an image (about a minute, longer for Firefox), which is
+        more than a typical attempt budget: call this in a prepare phase, then create sessions with
+        ``no_build=True`` so they fail fast with ``image_not_ready`` instead of building mid-attempt.
+
+        Returns {"chromium": "ready" | "built", ...}. ``on_progress({"browser", "message"})`` is
+        called with build steps. There is no timeout unless you pass ``timeout`` (seconds of silence;
+        the daemon sends a keep-alive every 10 s).
+        """
+        body = json.dumps({"browsers": browsers or ["chromium"]}).encode()
+        req = urllib.request.Request(
+            f"http://{self.addr}/v1/images/prepare", data=body, method="POST",
+            headers={"Content-Type": "application/json",
+                     **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})})
+        last = None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        last = json.loads(line)
+                    except ValueError:
+                        continue
+                    if last.get("event") == "progress" and on_progress:
+                        on_progress({"browser": last.get("browser"), "message": last.get("message")})
+        except urllib.error.HTTPError as e:
+            try:
+                b = json.loads(e.read() or b"{}")
+            finally:
+                e.close()
+            raise LocalImageError(b.get("error", f"HTTP {e.code}"), code=b.get("code", f"http_{e.code}"),
+                                  status=e.code) from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, TimeoutError):
+                raise LocalImageError(f"prepare did not answer within {timeout} s", code="request_timeout") from None
+            raise LocalImageError(f"localimage daemon not reachable at {self.addr}; start it with "
+                                  f"`localimage start`, or use ensure_daemon() ({reason})",
+                                  code="daemon_unreachable") from None
+        if not last or last.get("event") == "ping":
+            raise LocalImageError("the daemon closed the connection before the build finished",
+                                  code="daemon_unreachable")
+        if last.get("event") == "error":
+            raise LocalImageError(last.get("error", "prepare failed"), code=last.get("code", "internal"))
+        return last.get("images", {})
+
+    def shutdown(self) -> bool:
+        """Stop the daemon. Running sessions are not removed; they expire by TTL once a daemon runs
+        again. Idempotent: True if a daemon was stopped, False if none was running."""
+        try:
+            self._open_once("POST", "/v1/shutdown")
+            return True
+        except LocalImageError as e:
+            if e.code == "daemon_unreachable":
+                return False
+            raise
+
+    def info(self) -> dict:
+        """The daemon's version, limits and load:
+        {"version", "max_sessions", "max_ttl_seconds", "running", "available"}."""
+        return self._call("GET", "/v1/info")
+
+    def assert_capacity(self, n: int) -> dict:
+        """Fail early, with a clear error, when ``n`` sessions could never run at once.
+
+        Call it before starting a pool of workers. It checks the daemon's limit
+        (LOCALIMAGE_MAX_SESSIONS), not the sessions free right now: others may finish, and
+        ``create(wait_seconds=...)`` queues for a slot. Returns ``info()``; raises
+        ``LocalImageError`` with ``limit_exceeded`` and details {"max", "requested"}.
+        """
+        info = self.info()
+        if n > info["max_sessions"]:
+            raise LocalImageError(
+                f"{n} concurrent sessions were requested but the daemon at {self.addr} allows "
+                f"{info['max_sessions']}; restart it with LOCALIMAGE_MAX_SESSIONS={n} (or higher), "
+                "or use fewer workers", code="limit_exceeded",
+                details={"max": info["max_sessions"], "requested": n})
+        return info
+
     def create(self, browser: str = "chromium", screen: Optional[str] = None,
                ttl_seconds: Optional[int] = None, profile: Optional[str] = None,
                memory_mb: Optional[int] = None, cpus: Optional[float] = None,
-               kiosk: bool = False, extensions: Optional[list] = None) -> Session:
+               kiosk: bool = False, extensions: Optional[list] = None,
+               tags: Optional[Dict[str, str]] = None, wait_seconds: Optional[int] = None,
+               no_build: bool = False, timeout: Optional[float] = None) -> Session:
+        """Start a browser session.
+
+        ``tags`` is {key: value} metadata stored on the session, returned by ``list()`` and usable
+        as a list filter (up to 20 tags; keys are letters, digits, '.', '_' and '-').
+        ``wait_seconds`` queues for a free session slot instead of failing at once with
+        ``limit_exceeded``. ``no_build=True`` fails with ``image_not_ready`` instead of building a
+        missing browser image (see ``prepare()``). ``timeout`` limits how long the call may stay
+        silent (default: no limit, because a first-run image build is one long request).
+        """
         s = self._call("POST", "/v1/sessions", {
             "browser": browser, "screen": screen or "", "ttl_seconds": ttl_seconds or 0,
             "profile": profile or "", "memory_mb": memory_mb or 0, "cpus": cpus or 0,
-            "kiosk": kiosk, "extensions": extensions or []})
+            "kiosk": kiosk, "extensions": extensions or [], "tags": tags or {},
+            "wait_seconds": wait_seconds or 0, "no_build": no_build}, timeout=timeout)
         return Session(s["id"], s["browser"], s["protocol"], s["connect_url"], s["live_url"],
-                       s["view_url"], s.get("profile"), s.get("extensions") or [], s["expires_at"], self)
+                       s["view_url"], s.get("profile"), s.get("extensions") or [], s.get("tags") or {},
+                       s.get("downloads_dir", "/home/neko/Downloads"), s["expires_at"], self)
 
-    def list(self) -> list:
-        return self._call("GET", "/v1/sessions")
+    def list(self, tags: Optional[Dict[str, str]] = None) -> list:
+        """List sessions in every state (a crashed worker can leave stopped containers), as the
+        daemon returns them: id, browser, protocol, state, tags, created_at, expires_at, ...
+        ``tags`` keeps only sessions that carry all of those tags."""
+        q = urllib.parse.urlencode([("tag", f"{k}={v}") for k, v in (tags or {}).items()])
+        return self._call("GET", "/v1/sessions" + (f"?{q}" if q else ""))
+
+    def delete(self, session_id: str) -> bool:
+        """Delete a session. Idempotent: True if this call removed it, False if it was already
+        gone (deleted, expired, or never existed), so releasing a lease twice, or after a failed
+        acquire, never raises. Other failures, such as ``daemon_unreachable``, still raise."""
+        try:
+            self._call("DELETE", f"/v1/sessions/{session_id}")
+            return True
+        except LocalImageError as e:
+            if e.code == "session_gone":
+                return False
+            raise
 
     def upload_extension(self, name: str, zip_bytes: bytes) -> dict:
         """Upload an unpacked Chromium extension as a zip (manifest.json at the root or in one folder)."""
@@ -161,6 +436,3 @@ class LocalImage:
 
     def delete_profile(self, name: str) -> None:
         self._call("DELETE", f"/v1/profiles/{name}")
-
-    def delete(self, session_id: str) -> None:
-        self._call("DELETE", f"/v1/sessions/{session_id}")

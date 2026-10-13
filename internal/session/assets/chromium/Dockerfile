@@ -7,7 +7,8 @@ RUN apt-get update \
 COPY chromium.conf /etc/neko/supervisord/chromium.conf
 COPY cdp_forward.py /etc/neko/cdp_forward.py
 COPY policies.json /etc/chromium/policies/managed/policies.json
-RUN mkdir -p /home/neko/.config/chromium && chown -R neko:neko /home/neko/.config
+RUN mkdir -p /home/neko/.config/chromium /home/neko/Downloads \
+ && chown -R neko:neko /home/neko/.config /home/neko/Downloads
 
 # Neko's stock check hits /health at the root, but sessions serve everything
 # under a per-session path prefix (NEKO_SERVER_PATH_PREFIX), so it always failed.

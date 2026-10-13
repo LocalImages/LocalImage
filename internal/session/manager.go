@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -23,6 +23,7 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -52,8 +53,8 @@ const (
 	PlaywrightVersion = "1.63.0"
 
 	// Image revisions are bumped when the matching assets/ change, forcing a rebuild.
-	chromiumRev = "r6"
-	firefoxRev  = "r3"
+	chromiumRev = "r7"
+	firefoxRev  = "r4"
 )
 
 // Protocol says how automation clients attach to a session.
@@ -87,20 +88,28 @@ type Record struct {
 	ViewerPwd   string // Neko login that can only watch
 	Profile     string
 	Extensions  []string
+	Tags        map[string]string
+	State       string // Docker state: created, running, exited, ...
+	CreatedAt   time.Time
 }
 
 // Session is the API view of a Record, with URLs relative to the daemon's
 // public address.
 type Session struct {
-	ID         string    `json:"id"`
-	Browser    string    `json:"browser"`
-	Protocol   string    `json:"protocol"`
-	ConnectURL string    `json:"connect_url"`
-	LiveURL    string    `json:"live_url"` // interactive: can control the browser
-	ViewURL    string    `json:"view_url"` // read-only: watch only
-	Profile    string    `json:"profile,omitempty"`
-	Extensions []string  `json:"extensions,omitempty"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	ID         string            `json:"id"`
+	Browser    string            `json:"browser"`
+	Protocol   string            `json:"protocol"`
+	ConnectURL string            `json:"connect_url"`
+	LiveURL    string            `json:"live_url"` // interactive: can control the browser
+	ViewURL    string            `json:"view_url"` // read-only: watch only
+	Profile    string            `json:"profile,omitempty"`
+	Extensions []string          `json:"extensions,omitempty"`
+	Tags       map[string]string `json:"tags,omitempty"`
+	// DownloadsDir is where the browser saves downloads; read files with the files API.
+	DownloadsDir string    `json:"downloads_dir"`
+	State        string    `json:"state"`
+	CreatedAt    time.Time `json:"created_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
 }
 
 // View renders the record for a client that reached the daemon at host.
@@ -111,15 +120,19 @@ func (r *Record) View(host string) *Session {
 		connect = "ws://" + host + base + "/pw"
 	}
 	return &Session{
-		ID:         r.ID,
-		Browser:    r.Browser,
-		Protocol:   r.Protocol,
-		ConnectURL: connect,
-		LiveURL:    "http://" + host + base + "/live/?usr=controller&pwd=" + r.AdminPwd + "&embed=1",
-		ViewURL:    "http://" + host + "/v/" + r.ViewToken + "/?usr=viewer&pwd=" + r.ViewerPwd + "&cast=1",
-		Profile:    r.Profile,
-		Extensions: r.Extensions,
-		ExpiresAt:  r.ExpiresAt,
+		ID:           r.ID,
+		Browser:      r.Browser,
+		Protocol:     r.Protocol,
+		ConnectURL:   connect,
+		LiveURL:      "http://" + host + base + "/live/?usr=controller&pwd=" + r.AdminPwd + "&embed=1",
+		ViewURL:      "http://" + host + "/v/" + r.ViewToken + "/?usr=viewer&pwd=" + r.ViewerPwd + "&cast=1",
+		Profile:      r.Profile,
+		Extensions:   r.Extensions,
+		Tags:         r.Tags,
+		DownloadsDir: "/home/neko/Downloads",
+		State:        r.State,
+		CreatedAt:    r.CreatedAt,
+		ExpiresAt:    r.ExpiresAt,
 	}
 }
 
@@ -127,11 +140,14 @@ type CreateOptions struct {
 	Browser    string
 	Screen     string // e.g. 1280x720@30
 	TTL        time.Duration
-	Profile    string   // named persistent browser profile (chromium only)
-	Kiosk      bool     // chromium: fullscreen without tabs or address bar
-	Extensions []string // chromium: names of uploaded extensions to load
-	Memory     int      // MiB, 0 = unlimited
-	CPUs       float64  // 0 = unlimited
+	Profile    string            // named persistent browser profile (chromium only)
+	Kiosk      bool              // chromium: fullscreen without tabs or address bar
+	Extensions []string          // chromium: names of uploaded extensions to load
+	Memory     int               // MiB, 0 = unlimited
+	CPUs       float64           // 0 = unlimited
+	Tags       map[string]string // caller metadata, stored as Docker labels
+	Wait       time.Duration     // how long to queue for a free slot (0 = fail at once)
+	NoBuild    bool              // fail with ErrNotReady instead of building a missing image
 }
 
 var profileName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,40}$`)
@@ -141,14 +157,19 @@ const (
 	viewerProfile = `{"is_admin":false,"can_login":true,"can_connect":true,"can_watch":true,"can_host":false,"can_share_media":false,"can_access_clipboard":false,"sends_inactive_cursor":false,"can_see_inactive_cursors":true}`
 )
 
-// ErrLimit is returned when a request exceeds a configured limit.
-var ErrLimit = errors.New("limit exceeded")
-
 type Manager struct {
 	cli         *client.Client
 	publicIP    string        // address clients use to reach WebRTC media
 	maxSessions int           // LOCALIMAGE_MAX_SESSIONS, default 10
 	maxTTL      time.Duration // LOCALIMAGE_MAX_TTL_SECONDS, default 24h
+
+	mu       sync.Mutex // guards inflight
+	inflight int        // creates that hold a slot but have no container yet
+	// activeFn counts sessions that occupy a slot. It is a field so tests can
+	// exercise the reservation logic without Docker.
+	activeFn func(context.Context) (int, error)
+	imagesFn func(context.Context) map[string]bool // which browser images are built
+	builds   sync.Map                              // image tag -> *sync.Mutex, so one build runs at a time per image
 }
 
 func New() (*Manager, error) {
@@ -160,12 +181,95 @@ func New() (*Manager, error) {
 	if ip == "" {
 		ip = "127.0.0.1"
 	}
-	return &Manager{
+	m := &Manager{
 		cli:         cli,
 		publicIP:    ip,
 		maxSessions: envInt("LOCALIMAGE_MAX_SESSIONS", 10),
 		maxTTL:      time.Duration(envInt("LOCALIMAGE_MAX_TTL_SECONDS", 24*3600)) * time.Second,
-	}, nil
+	}
+	m.activeFn = m.dockerActiveCount
+	m.imagesFn = m.ImagesReady
+	return m, nil
+}
+
+// dockerActiveCount counts managed containers that are running or about to run.
+func (m *Manager) dockerActiveCount(ctx context.Context) (int, error) {
+	f := filters.NewArgs(filters.Arg("label", labelManaged+"=true"))
+	for _, st := range []string{"created", "running", "restarting"} {
+		f.Add("status", st)
+	}
+	list, err := m.cli.ContainerList(ctx, container.ListOptions{Filters: f})
+	return len(list), err
+}
+
+// Info describes the daemon's limits and current load.
+type Info struct {
+	MaxSessions   int `json:"max_sessions"`
+	MaxTTLSeconds int `json:"max_ttl_seconds"`
+	Running       int `json:"running"`
+	Available     int `json:"available"`
+	// Images says which browser images are already built; a missing one is built on first use.
+	Images map[string]bool `json:"images"`
+}
+
+func (m *Manager) Info(ctx context.Context) (*Info, error) {
+	active, err := m.activeFn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	active += m.inflight
+	m.mu.Unlock()
+	avail := m.maxSessions - active
+	if avail < 0 {
+		avail = 0
+	}
+	info := &Info{MaxSessions: m.maxSessions, MaxTTLSeconds: int(m.maxTTL.Seconds()), Running: active, Available: avail}
+	if m.imagesFn != nil {
+		info.Images = m.imagesFn(ctx)
+	}
+	return info, nil
+}
+
+// reserve claims one session slot, waiting up to wait for one to free up (0
+// means fail at once). The returned release must be called as soon as the
+// container exists (Docker then counts it) or the create failed.
+//
+// Counting and claiming happen under one lock so a burst of simultaneous
+// creates cannot all pass the check and exceed the limit.
+func (m *Manager) reserve(ctx context.Context, wait time.Duration) (func(), error) {
+	deadline := time.Now().Add(wait)
+	for {
+		m.mu.Lock()
+		active, err := m.activeFn(ctx)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+		if active+m.inflight < m.maxSessions {
+			m.inflight++
+			m.mu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					m.mu.Lock()
+					m.inflight--
+					m.mu.Unlock()
+				})
+			}, nil
+		}
+		busy := active + m.inflight
+		m.mu.Unlock()
+
+		if !time.Now().Before(deadline) {
+			return nil, &LimitError{Max: m.maxSessions, Active: busy}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func envInt(name string, def int) int {
@@ -192,6 +296,50 @@ func (m *Manager) ImageReady(ctx context.Context, browser string) bool {
 	}
 	_, err := m.cli.ImageInspect(ctx, spec.image)
 	return err == nil
+}
+
+// ImagesReady reports, for every supported browser, whether its image is built.
+func (m *Manager) ImagesReady(ctx context.Context) map[string]bool {
+	out := map[string]bool{}
+	for name := range browsers {
+		out[name] = m.ImageReady(ctx, name)
+	}
+	return out
+}
+
+// Prepare builds the images for the given browsers (default: chromium) if they are
+// missing, so the first session does not have to. It reports "ready" for images that
+// already existed and "built" for ones it built. progress, if set, receives step
+// headlines of a build. Cancelling ctx cancels a build in progress.
+func (m *Manager) Prepare(ctx context.Context, names []string, progress func(browser, msg string)) (map[string]string, error) {
+	if len(names) == 0 {
+		names = []string{"chromium"}
+	}
+	say := func(b, msg string) {
+		if progress != nil {
+			progress(b, msg)
+		}
+	}
+	for _, n := range names {
+		if _, ok := browsers[n]; !ok {
+			return nil, invalid("unsupported browser %q", n)
+		}
+	}
+	out := map[string]string{}
+	for _, n := range names {
+		if m.ImageReady(ctx, n) {
+			out[n] = "ready"
+			say(n, "already built")
+			continue
+		}
+		say(n, "building the image (first use only; this can take several minutes)")
+		b := n
+		if err := m.ensureImage(ctx, n, browsers[n], func(line string) { say(b, line) }); err != nil {
+			return out, fmt.Errorf("prepare %s image: %w", n, err)
+		}
+		out[n] = "built"
+	}
+	return out, nil
 }
 
 // Limits returns the configured session and TTL limits.
@@ -222,11 +370,19 @@ func freePort() (int, error) {
 	return 0, fmt.Errorf("no free port found")
 }
 
-func (m *Manager) ensureImage(ctx context.Context, name string, spec browserSpec) error {
+func (m *Manager) ensureImage(ctx context.Context, name string, spec browserSpec, onLog func(string)) error {
 	if _, err := m.cli.ImageInspect(ctx, spec.image); err == nil {
 		return nil
 	}
-	return m.buildImage(ctx, name, spec.image)
+	// Many creates can arrive at once on a fresh machine; build the image once
+	// and let the others wait for it.
+	mu, _ := m.builds.LoadOrStore(spec.image, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+	if _, err := m.cli.ImageInspect(ctx, spec.image); err == nil {
+		return nil
+	}
+	return m.buildImage(ctx, name, spec.image, onLog)
 }
 
 func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, error) {
@@ -235,7 +391,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	}
 	spec, ok := browsers[opts.Browser]
 	if !ok {
-		return nil, fmt.Errorf("unsupported browser %q", opts.Browser)
+		return nil, invalid("unsupported browser %q", opts.Browser)
 	}
 	if opts.Screen == "" {
 		opts.Screen = "1440x900@30"
@@ -246,23 +402,39 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	if opts.TTL > m.maxTTL {
 		return nil, fmt.Errorf("%w: ttl_seconds may not exceed %d", ErrLimit, int(m.maxTTL.Seconds()))
 	}
-	if running, err := m.List(ctx); err != nil {
+	if err := validateTags(opts.Tags); err != nil {
 		return nil, err
-	} else if len(running) >= m.maxSessions {
-		return nil, fmt.Errorf("%w: %d sessions are already running (LOCALIMAGE_MAX_SESSIONS=%d)", ErrLimit, len(running), m.maxSessions)
 	}
 	if opts.Profile != "" {
 		if !profileName.MatchString(opts.Profile) {
-			return nil, fmt.Errorf("invalid profile name %q (use a-z, 0-9, - and _)", opts.Profile)
+			return nil, invalid("invalid profile name %q (use a-z, 0-9, - and _)", opts.Profile)
 		}
 		if spec.protocol != ProtocolCDP {
-			return nil, fmt.Errorf("profiles are only supported for chromium")
+			return nil, invalid("profiles are only supported for chromium")
 		}
+	}
+	if (opts.Kiosk || len(opts.Extensions) > 0) && spec.protocol != ProtocolCDP {
+		return nil, invalid("kiosk mode and extensions are only supported for chromium")
+	}
+
+	if opts.NoBuild && !m.ImageReady(ctx, opts.Browser) {
+		return nil, notReady(opts.Browser)
+	}
+
+	// Claim a slot (queueing if asked) before any side effect, so a refused
+	// create leaves nothing behind.
+	release, err := m.reserve(ctx, opts.Wait)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if opts.Profile != "" {
 		if err := m.claimProfile(ctx, opts.Profile); err != nil {
 			return nil, err
 		}
 	}
-	if err := m.ensureImage(ctx, opts.Browser, spec); err != nil {
+	if err := m.ensureImage(ctx, opts.Browser, spec, nil); err != nil {
 		return nil, fmt.Errorf("prepare %s image: %w", opts.Browser, err)
 	}
 
@@ -272,6 +444,22 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	}
 
 	id := randHex(4)
+	name := "localimage-" + id
+	// If the client gives up (or anything else fails) at any point from here on, remove
+	// the container by its name. Docker may have created it even though the call that
+	// asked for it was cancelled, in which case we never learned its ID.
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = m.cli.ContainerRemove(rctx, name, container.RemoveOptions{Force: true, RemoveVolumes: true})
+		}
+	}()
+	// The docker calls that create and start the container are not tied to the request:
+	// cancelling them half way is what leaves orphans behind. Cancellation is honoured
+	// while waiting for readiness, and the defer above removes the container.
+	bg := context.WithoutCancel(ctx)
 	token := randHex(16)
 	viewToken := randHex(16)
 	adminPwd, viewerPwd := randHex(12), randHex(12)
@@ -327,8 +515,8 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	if opts.Profile != "" {
 		cfg.Labels[labelProfile] = opts.Profile
 	}
-	if (opts.Kiosk || len(opts.Extensions) > 0) && spec.protocol != ProtocolCDP {
-		return nil, fmt.Errorf("kiosk mode and extensions are only supported for chromium")
+	for k, v := range opts.Tags {
+		cfg.Labels[labelTagPrefix+k] = v
 	}
 	var chromiumArgs []string
 	if opts.Kiosk {
@@ -368,15 +556,16 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 		})
 	}
 
-	created, err := m.cli.ContainerCreate(ctx, cfg, host, nil, nil, "localimage-"+id)
+	created, err := m.cli.ContainerCreate(bg, cfg, host, nil, nil, name)
 	if err != nil {
 		return nil, err
 	}
+	release() // the container now exists, so Docker counts it against the limit
 	cleanup := func() {
 		_ = m.cli.ContainerRemove(context.Background(), created.ID, container.RemoveOptions{Force: true})
 	}
 
-	if err := m.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+	if err := m.cli.ContainerStart(bg, created.ID, container.StartOptions{}); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -390,6 +579,10 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 		cleanup()
 		return nil, err
 	}
+	if spec.protocol == ProtocolCDP {
+		m.fitWindow(ctx, created.ID)
+	}
+	succeeded = true
 	return rec, nil
 }
 
@@ -449,7 +642,7 @@ func (m *Manager) findContainer(ctx context.Context, label string) (string, erro
 		return "", err
 	}
 	if len(list) == 0 {
-		return "", fmt.Errorf("session not found")
+		return "", ErrNotFound
 	}
 	return list[0].ID, nil
 }
@@ -461,6 +654,9 @@ func (m *Manager) byLabel(ctx context.Context, label string) (*Record, error) {
 	}
 	info, err := m.cli.ContainerInspect(ctx, cid)
 	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	return toRecord(info), nil
@@ -492,6 +688,7 @@ func toRecord(info container.InspectResponse) *Record {
 	}
 	l := info.Config.Labels
 	exp, _ := time.Parse(time.RFC3339, l[labelExpires])
+	created, _ := time.Parse(time.RFC3339Nano, info.Created)
 	spec := browsers[l[labelBrowser]]
 	backend := nat.Port(cdpPort)
 	if spec.protocol == ProtocolPlaywright {
@@ -510,12 +707,18 @@ func toRecord(info container.InspectResponse) *Record {
 		ViewerPwd:   l[labelViewer],
 		Profile:     l[labelProfile],
 		Extensions:  splitNonEmpty(l[labelExts]),
+		Tags:        tagsFromLabels(l),
+		State:       info.State.Status,
+		CreatedAt:   created,
 	}
 }
 
-func (m *Manager) List(ctx context.Context) ([]*Record, error) {
+// List returns managed sessions in every state (a crashed worker can leave
+// stopped containers behind), optionally only those carrying all of tags.
+func (m *Manager) List(ctx context.Context, tags map[string]string) ([]*Record, error) {
 	f := filters.NewArgs(filters.Arg("label", labelManaged+"=true"))
-	list, err := m.cli.ContainerList(ctx, container.ListOptions{Filters: f})
+	addTagFilters(f, tags)
+	list, err := m.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
 		return nil, err
 	}
@@ -523,24 +726,43 @@ func (m *Manager) List(ctx context.Context) ([]*Record, error) {
 	for _, c := range list {
 		info, err := m.cli.ContainerInspect(ctx, c.ID)
 		if err != nil {
-			continue
+			continue // removed since the list was taken
 		}
 		out = append(out, toRecord(info))
 	}
 	return out, nil
 }
 
+// Delete removes a session. It returns ErrNotFound if there is no such
+// session (already deleted, expired, or never existed), which callers that
+// release a lease should treat as success.
 func (m *Manager) Delete(ctx context.Context, id string) error {
 	cid, err := m.findContainer(ctx, labelID+"="+id)
 	if err != nil {
 		return err
 	}
-	if rec, err := m.byID(ctx, id); err == nil && rec.Profile != "" {
+	info, err := m.cli.ContainerInspect(ctx, cid)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if info.Config.Labels[labelProfile] != "" {
 		// Let Chromium shut down cleanly so cookies and storage reach disk.
 		timeout := 20
 		_ = m.cli.ContainerStop(ctx, cid, container.StopOptions{Timeout: &timeout})
 	}
-	return m.cli.ContainerRemove(ctx, cid, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	err = m.cli.ContainerRemove(ctx, cid, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	switch {
+	case err == nil:
+		return nil
+	case errdefs.IsNotFound(err):
+		return ErrNotFound // a concurrent delete won the race
+	case strings.Contains(err.Error(), "already in progress"):
+		return ErrNotFound // another delete is removing it right now: only that one reports success
+	}
+	return err
 }
 
 func profileVolume(name string) string { return "localimage-profile-" + name }
@@ -552,7 +774,7 @@ func (m *Manager) claimProfile(ctx context.Context, name string) error {
 	if list, err := m.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f}); err != nil {
 		return err
 	} else if len(list) > 0 {
-		return fmt.Errorf("profile %q is already in use by another session", name)
+		return conflict("profile %q is already in use by another session", name)
 	}
 	_, err := m.cli.VolumeCreate(ctx, volume.CreateOptions{
 		Name:   profileVolume(name),
@@ -577,14 +799,14 @@ func (m *Manager) Profiles(ctx context.Context) ([]string, error) {
 // DeleteProfile removes a saved profile. It fails while a session uses it.
 func (m *Manager) DeleteProfile(ctx context.Context, name string) error {
 	if !profileName.MatchString(name) {
-		return fmt.Errorf("invalid profile name")
+		return invalid("invalid profile name")
 	}
 	return m.cli.VolumeRemove(ctx, profileVolume(name), false)
 }
 
 // Reap removes sessions whose TTL has passed.
 func (m *Manager) Reap(ctx context.Context) {
-	list, err := m.List(ctx)
+	list, err := m.List(ctx, nil)
 	if err != nil {
 		return
 	}

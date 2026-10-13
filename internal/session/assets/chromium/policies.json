@@ -9,5 +9,6 @@
   "DefaultNotificationsSetting": 2,
   "BookmarkBarEnabled": false,
   "BrowserAddPersonEnabled": false,
-  "PromptForDownloadLocation": false
+  "PromptForDownloadLocation": false,
+  "DownloadDirectory": "/home/neko/Downloads"
 }

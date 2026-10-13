@@ -7,11 +7,11 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LocalImages/LocalImage/internal/proxy"
@@ -19,11 +19,15 @@ import (
 )
 
 type Server struct {
-	mgr    *session.Manager
-	apiKey string // optional; guards /v1 when set
+	mgr        *session.Manager
+	apiKey     string // optional; guards /v1 when set
+	version    string
+	onShutdown func() // called by POST /v1/shutdown; may be nil
 }
 
-func New(mgr *session.Manager, apiKey string) *Server { return &Server{mgr: mgr, apiKey: apiKey} }
+func New(mgr *session.Manager, apiKey, version string, onShutdown func()) *Server {
+	return &Server{mgr: mgr, apiKey: apiKey, version: version, onShutdown: onShutdown}
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -33,16 +37,12 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = enc.Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, map[string]string{"error": err.Error()})
-}
-
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.apiKey != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.apiKey)) != 1 {
-				writeErr(w, http.StatusUnauthorized, errUnauthorized)
+				fail(w, http.StatusUnauthorized, errUnauthorized)
 				return
 			}
 		}
@@ -59,6 +59,9 @@ const errUnauthorized = apiError("missing or invalid API key")
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/sessions", s.auth(s.create))
+	mux.HandleFunc("GET /v1/info", s.auth(s.info))
+	mux.HandleFunc("POST /v1/shutdown", s.auth(s.shutdown))
+	mux.HandleFunc("POST /v1/images/prepare", s.auth(s.prepare))
 	mux.HandleFunc("GET /v1/sessions", s.auth(s.list))
 	mux.HandleFunc("GET /v1/sessions/{id}", s.auth(s.get))
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.auth(s.delete))
@@ -96,12 +99,22 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		Kiosk      bool     `json:"kiosk"`
 		Extensions []string `json:"extensions"`
 		CPUs       float64  `json:"cpus"`
+		// Tags are caller metadata stored on the session and usable as list filters.
+		Tags map[string]string `json:"tags"`
+		// WaitSeconds queues the request for a free slot instead of failing at once.
+		WaitSeconds int `json:"wait_seconds"`
+		// NoBuild fails with image_not_ready instead of building a missing browser image.
+		NoBuild bool `json:"no_build"`
 	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			fail(w, http.StatusBadRequest, err)
 			return
 		}
+	}
+	if req.WaitSeconds < 0 || req.WaitSeconds > 600 {
+		fail(w, http.StatusBadRequest, apiError("wait_seconds must be between 0 and 600"))
+		return
 	}
 	rec, err := s.mgr.Create(r.Context(), session.CreateOptions{
 		Browser:    req.Browser,
@@ -112,22 +125,136 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		Kiosk:      req.Kiosk,
 		Extensions: req.Extensions,
 		CPUs:       req.CPUs,
+		Tags:       req.Tags,
+		Wait:       time.Duration(req.WaitSeconds) * time.Second,
+		NoBuild:    req.NoBuild,
 	})
 	if err != nil {
-		code := http.StatusInternalServerError
-		if errors.Is(err, session.ErrLimit) {
-			code = http.StatusTooManyRequests
-		}
-		writeErr(w, code, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, rec.View(r.Host))
 }
 
-func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	recs, err := s.mgr.List(r.Context())
+// prepare builds the browser images that are missing, so the first session does not have to.
+// The response is a stream of newline-delimited JSON events, because a build can take minutes:
+//
+//	{"event":"progress","browser":"firefox","message":"Step 3/9 : ..."}
+//	{"event":"ping"}                                   every 10 s, so no client times out
+//	{"event":"done","images":{"chromium":"ready","firefox":"built"}}
+//	{"event":"error","error":"...","code":"..."}       the last line when it failed
+//
+// The headers go out at once, so the status is always 200: read the last event for the outcome.
+// If the client disconnects, the build is cancelled.
+func (s *Server) prepare(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Browsers []string `json:"browsers"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			fail(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		fail(w, http.StatusInternalServerError, apiError("streaming is not supported"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+
+	var mu sync.Mutex
+	send := func(v any) {
+		mu.Lock()
+		defer mu.Unlock()
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(v)
+		flusher.Flush()
+	}
+	send(map[string]string{"event": "ping"}) // flush the headers now
+
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				send(map[string]string{"event": "ping"})
+			}
+		}
+	}()
+	defer close(done)
+
+	images, err := s.mgr.Prepare(r.Context(), req.Browsers, func(browser, msg string) {
+		send(map[string]string{"event": "progress", "browser": browser, "message": msg})
+	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		_, code, _ := classify(err, http.StatusInternalServerError)
+		send(map[string]any{"event": "error", "error": err.Error(), "code": code, "images": images})
+		return
+	}
+	send(map[string]any{"event": "done", "images": images})
+}
+
+// shutdown stops the daemon gracefully. Sessions keep running as containers; they are
+// removed when their TTL passes and a daemon is running again, or with `localimage rm`.
+func (s *Server) shutdown(w http.ResponseWriter, _ *http.Request) {
+	if s.onShutdown == nil {
+		fail(w, http.StatusNotFound, apiError("shutdown is not available"))
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "shutting down"})
+	go func() {
+		time.Sleep(100 * time.Millisecond) // let the response go out first
+		s.onShutdown()
+	}()
+}
+
+// parseTagFilters turns repeated ?tag=key=value parameters into a filter map.
+func parseTagFilters(vals []string) (map[string]string, error) {
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	tags := make(map[string]string, len(vals))
+	for _, v := range vals {
+		k, val, ok := strings.Cut(v, "=")
+		if !ok || k == "" {
+			return nil, apiError("tag filters look like ?tag=key=value, got " + strconv.Quote(v))
+		}
+		tags[k] = val
+	}
+	return tags, nil
+}
+
+// info reports the daemon's version and limits, so a client can check capacity
+// (max_sessions, running, available) before it starts many sessions at once.
+func (s *Server) info(w http.ResponseWriter, r *http.Request) {
+	info, err := s.mgr.Info(r.Context())
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Version string `json:"version"`
+		*session.Info
+	}{s.version, info})
+}
+
+func (s *Server) list(w http.ResponseWriter, r *http.Request) {
+	tags, err := parseTagFilters(r.URL.Query()["tag"])
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	recs, err := s.mgr.List(r.Context(), tags)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	out := make([]*session.Session, 0, len(recs))
@@ -140,7 +267,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	rec, err := s.mgr.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		fail(w, http.StatusNotFound, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, rec.View(r.Host))
@@ -148,19 +275,19 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 	if err := s.mgr.Delete(r.Context(), r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		fail(w, http.StatusNotFound, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) recStart(w http.ResponseWriter, r *http.Request) {
-	rid, err := s.mgr.StartRecording(r.Context(), r.PathValue("id"))
+	info, err := s.mgr.StartRecording(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusConflict, err)
+		fail(w, http.StatusConflict, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"replay_id": rid, "status": "recording"})
+	writeJSON(w, http.StatusAccepted, info)
 }
 
 func (s *Server) recStop(w http.ResponseWriter, r *http.Request) {
@@ -170,18 +297,18 @@ func (s *Server) recStop(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength != 0 {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
-	rid, err := s.mgr.StopRecording(r.Context(), r.PathValue("id"), req.ReplayID)
+	info, err := s.mgr.StopRecording(r.Context(), r.PathValue("id"), req.ReplayID)
 	if err != nil {
-		writeErr(w, http.StatusConflict, err)
+		fail(w, http.StatusConflict, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"replay_id": rid, "status": "stopped"})
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) recList(w http.ResponseWriter, r *http.Request) {
 	list, err := s.mgr.Recordings(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		fail(w, http.StatusNotFound, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -192,7 +319,7 @@ func (s *Server) recDownload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var buf bytes.Buffer
 	if _, err := s.mgr.DownloadRecording(r.Context(), id, r.PathValue("rid"), &buf); err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		fail(w, http.StatusNotFound, err)
 		return
 	}
 	w.Header().Set("Content-Type", "video/mp4")
@@ -207,12 +334,12 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds int      `json:"timeout_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	res, err := s.mgr.Exec(r.Context(), r.PathValue("id"), req.Command, req.Cwd, req.TimeoutSeconds)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -221,7 +348,7 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 func (s *Server) fileUpload(w http.ResponseWriter, r *http.Request) {
 	n, err := s.mgr.UploadFile(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"), r.Body)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"size": n})
@@ -230,7 +357,7 @@ func (s *Server) fileUpload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) fileDownload(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 	if _, err := s.mgr.DownloadFile(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"), &buf); err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		fail(w, http.StatusNotFound, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -240,7 +367,7 @@ func (s *Server) fileDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) fileList(w http.ResponseWriter, r *http.Request) {
 	list, err := s.mgr.ListFiles(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -250,12 +377,12 @@ func (s *Server) fileList(w http.ResponseWriter, r *http.Request) {
 func (s *Server) extUpload(w http.ResponseWriter, r *http.Request) {
 	data, err := io.ReadAll(io.LimitReader(r.Body, 51<<20))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	ext, err := s.mgr.AddExtension(r.Context(), r.URL.Query().Get("name"), data)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, ext)
@@ -264,7 +391,7 @@ func (s *Server) extUpload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) extList(w http.ResponseWriter, r *http.Request) {
 	list, err := s.mgr.Extensions(r.Context())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -272,7 +399,7 @@ func (s *Server) extList(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) extDelete(w http.ResponseWriter, r *http.Request) {
 	if err := s.mgr.DeleteExtension(r.Context(), r.PathValue("name")); err != nil {
-		writeErr(w, http.StatusConflict, err)
+		fail(w, http.StatusConflict, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -286,7 +413,7 @@ func (s *Server) screenshot(w http.ResponseWriter, r *http.Request) {
 	}
 	png, err := s.mgr.Screenshot(r.Context(), r.PathValue("id"), region)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		fail(w, http.StatusNotFound, err)
 		return
 	}
 	w.Header().Set("Content-Type", "image/png")
@@ -296,7 +423,7 @@ func (s *Server) screenshot(w http.ResponseWriter, r *http.Request) {
 func (s *Server) profiles(w http.ResponseWriter, r *http.Request) {
 	names, err := s.mgr.Profiles(r.Context())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		fail(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, names)
@@ -304,7 +431,7 @@ func (s *Server) profiles(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
 	if err := s.mgr.DeleteProfile(r.Context(), r.PathValue("name")); err != nil {
-		writeErr(w, http.StatusConflict, err)
+		fail(w, http.StatusConflict, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -324,7 +451,7 @@ func (s *Server) computer(w http.ResponseWriter, r *http.Request) {
 		Path    [][2]int `json:"path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	id, pt := r.PathValue("id"), session.Point{X: req.X, Y: req.Y}
@@ -347,11 +474,11 @@ func (s *Server) computer(w http.ResponseWriter, r *http.Request) {
 		}
 		err = s.mgr.Drag(r.Context(), id, path, req.Button)
 	default:
-		writeErr(w, http.StatusNotFound, apiError("unknown action"))
+		fail(w, http.StatusNotFound, apiError("unknown action"))
 		return
 	}
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

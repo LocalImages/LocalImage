@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -78,111 +75,6 @@ func (m *Manager) Screenshot(ctx context.Context, id string, region *Region) ([]
 
 func (m *Manager) containerOf(ctx context.Context, id string) (string, error) {
 	return m.findContainer(ctx, labelID+"="+id)
-}
-
-// StartRecording begins capturing the session's display to an MP4 and returns
-// the recording id. Files are fragmented so they stay playable even if the
-// container is killed. Only one recording can run at a time per session.
-func (m *Manager) StartRecording(ctx context.Context, id string) (string, error) {
-	cid, err := m.containerOf(ctx, id)
-	if err != nil {
-		return "", err
-	}
-	rid := randHex(4)
-	script := fmt.Sprintf(`
-mkdir -p %[1]s
-for f in %[1]s/*.pid; do
-  [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && { echo "a recording is already running"; exit 3; }
-done
-nohup ffmpeg -y -loglevel error -f x11grab -framerate 15 -i :99.0 \
-  -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
-  -movflags +frag_keyframe+empty_moov+default_base_moof %[1]s/%[2]s.mp4 </dev/null >%[1]s/%[2]s.log 2>&1 &
-echo $! > %[1]s/%[2]s.pid
-sleep 1
-kill -0 "$(cat %[1]s/%[2]s.pid)" 2>/dev/null || { cat %[1]s/%[2]s.log; exit 4; }
-`, recDir, rid)
-	out, code, err := m.run(ctx, cid, "neko", "sh", "-c", script)
-	if err != nil {
-		return "", err
-	}
-	if code != 0 {
-		return "", fmt.Errorf("start recording: %s", bytes.TrimSpace([]byte(out)))
-	}
-	return rid, nil
-}
-
-// StopRecording finalizes a recording (the running one if rid is empty) and
-// returns its id once ffmpeg has exited.
-func (m *Manager) StopRecording(ctx context.Context, id, rid string) (string, error) {
-	if rid != "" && !recID.MatchString(rid) {
-		return "", fmt.Errorf("invalid recording id")
-	}
-	cid, err := m.containerOf(ctx, id)
-	if err != nil {
-		return "", err
-	}
-	script := fmt.Sprintf(`
-rid="$1"
-if [ -z "$rid" ]; then
-  for f in %[1]s/*.pid; do
-    [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && rid=$(basename "$f" .pid)
-  done
-fi
-[ -n "$rid" ] && [ -f %[1]s/$rid.pid ] || { echo "no running recording"; exit 3; }
-pid=$(cat %[1]s/$rid.pid)
-kill -INT "$pid" 2>/dev/null
-for i in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || { echo "$rid"; exit 0; }; sleep 0.1; done
-kill -KILL "$pid"; echo "$rid"
-`, recDir)
-	out, code, err := m.run(ctx, cid, "neko", "sh", "-c", script, "sh", rid)
-	if err != nil {
-		return "", err
-	}
-	if code != 0 {
-		return "", fmt.Errorf("stop recording: %s", bytes.TrimSpace([]byte(out)))
-	}
-	return string(bytes.TrimSpace([]byte(out))), nil
-}
-
-type RecordingInfo struct {
-	ID        string `json:"replay_id"`
-	Running   bool   `json:"running"`
-	Size      int64  `json:"size"`
-	StartedAt int64  `json:"started_at"` // unix seconds
-}
-
-// Recordings lists a session's recordings, oldest first.
-func (m *Manager) Recordings(ctx context.Context, id string) ([]RecordingInfo, error) {
-	cid, err := m.containerOf(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	script := fmt.Sprintf(`
-for f in %[1]s/*.mp4; do
-  [ -f "$f" ] || continue
-  rid=$(basename "$f" .mp4); run=0
-  [ -f %[1]s/$rid.pid ] && kill -0 "$(cat %[1]s/$rid.pid)" 2>/dev/null && run=1
-  printf '%%s\t%%s\t%%s\t%%s\n' "$rid" "$run" "$(stat -c %%s "$f")" "$(stat -c %%W "$f")"
-done`, recDir)
-	out, code, err := m.run(ctx, cid, "neko", "sh", "-c", script)
-	if err != nil {
-		return nil, err
-	}
-	if code != 0 {
-		return nil, fmt.Errorf("list recordings: %s", bytes.TrimSpace([]byte(out)))
-	}
-	list := []RecordingInfo{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		f := strings.Split(line, "\t")
-		if len(f) != 4 {
-			continue
-		}
-		size, _ := strconv.ParseInt(f[2], 10, 64)
-		born, _ := strconv.ParseInt(f[3], 10, 64)
-		list = append(list, RecordingInfo{ID: f[0], Running: f[1] == "1", Size: size, StartedAt: born})
-	}
-	sort.Slice(list, func(i, j int) bool { return list[i].StartedAt < list[j].StartedAt })
-	return list, nil
 }
 
 // DownloadRecording streams a recording (the latest if rid is empty) to w.

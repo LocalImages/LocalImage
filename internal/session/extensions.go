@@ -142,14 +142,14 @@ func zipToTar(data []byte) (*bytes.Buffer, *manifest, error) {
 // AddExtension stores (or replaces) the extension called name from a zip.
 func (m *Manager) AddExtension(ctx context.Context, name string, zipData []byte) (*Extension, error) {
 	if !profileName.MatchString(name) {
-		return nil, fmt.Errorf("invalid extension name %q (use a-z, 0-9, - and _)", name)
+		return nil, invalid("invalid extension name %q (use a-z, 0-9, - and _)", name)
 	}
 	tarball, man, err := zipToTar(zipData)
 	if err != nil {
 		return nil, err
 	}
 	spec := browsers[extVolumeImage]
-	if err := m.ensureImage(ctx, extVolumeImage, spec); err != nil {
+	if err := m.ensureImage(ctx, extVolumeImage, spec, nil); err != nil {
 		return nil, err
 	}
 	// Replace any previous version; this fails while a session uses it.
@@ -214,10 +214,10 @@ func (m *Manager) extensionMounts(ctx context.Context, names []string) ([]mount.
 		}
 		seen[n] = true
 		if !profileName.MatchString(n) {
-			return nil, "", fmt.Errorf("invalid extension name %q", n)
+			return nil, "", invalid("invalid extension name %q", n)
 		}
 		if _, err := m.cli.VolumeInspect(ctx, extVolume(n)); err != nil {
-			return nil, "", fmt.Errorf("extension %q not found (upload it first)", n)
+			return nil, "", invalid("extension %q not found (upload it first)", n)
 		}
 		target := extMountDir + "/" + n
 		mounts = append(mounts, mount.Mount{Type: mount.TypeVolume, Source: extVolume(n), Target: target, ReadOnly: true})
