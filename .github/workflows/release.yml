@@ -46,10 +46,24 @@ jobs:
         with:
           name: dist
           path: dist
+      - name: Restore executable bits
+        # Artifacts do not keep file permissions, so without this the published
+        # binaries are not executable (this broke 0.1.0).
+        run: chmod +x dist/npm/*-*/bin/localimage*
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Smoke test the packages before publishing
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          test -x dist/npm/linux-x64/bin/localimage || { echo "binary is not executable"; exit 1; }
+          tmp="$(mktemp -d)"
+          (cd dist/npm/localimage && npm pack --pack-destination "$tmp")
+          (cd dist/npm/linux-x64 && npm pack --pack-destination "$tmp")
+          cd "$tmp" && npm init -y >/dev/null
+          npm install --omit=optional "./localimage-$v.tgz" "./localimage-linux-x64-$v.tgz"
+          test "$(npx --no-install localimage --version)" = "$v"
       - name: Publish platform packages, then the main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -86,6 +100,7 @@ jobs:
           path: dist
       - name: Collect binaries and checksums
         run: |
+          chmod +x dist/bin/*/localimage*
           mkdir release
           for d in dist/bin/*/; do
             name="$(basename "$d")"

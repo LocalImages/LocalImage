@@ -14,4 +14,7 @@ def main() -> None:
         binary = bundled if os.path.exists(bundled) else shutil.which("localimage")
     if not binary:
         sys.exit("localimage: no binary found. Set LOCALIMAGE_BIN to a built binary.")
-    sys.exit(subprocess.call([binary, *sys.argv[1:]]))
+    try:
+        sys.exit(subprocess.call([binary, *sys.argv[1:]]))
+    except OSError as e:
+        sys.exit(f"localimage: could not run {binary}: {e}")

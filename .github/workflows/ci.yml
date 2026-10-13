@@ -45,6 +45,20 @@ jobs:
       - name: Check npm packages
         run: |
           for d in dist/npm/*/; do (cd "$d" && npm pack --dry-run); done
+      - name: Install the built npm packages and run the CLI
+        run: |
+          v="$(cat VERSION)"
+          tmp="$(mktemp -d)"
+          (cd dist/npm/localimage && npm pack --pack-destination "$tmp")
+          (cd dist/npm/linux-x64 && npm pack --pack-destination "$tmp")
+          cd "$tmp" && npm init -y >/dev/null
+          npm install --omit=optional "./localimage-$v.tgz" "./localimage-linux-x64-$v.tgz"
+          test "$(npx --no-install localimage --version)" = "$v"
+      - name: Install the built wheel and run the CLI
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/wheels/*manylinux_2_17_x86_64*.whl
+          test "$(/tmp/venv/bin/localimage --version)" = "$(cat VERSION)"
 
   e2e:
     name: End-to-end (Docker)
