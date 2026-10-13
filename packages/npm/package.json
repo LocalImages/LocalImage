@@ -1,0 +1,60 @@
+{
+  "name": "localimage",
+  "version": "0.1.0",
+  "description": "Run headful browsers in Docker with live view, locally. CLI + SDK.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "localimage": "bin/localimage.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "optionalDependencies": {
+    "@localimage/linux-x64": "0.1.0",
+    "@localimage/linux-arm64": "0.1.0",
+    "@localimage/darwin-x64": "0.1.0",
+    "@localimage/darwin-arm64": "0.1.0",
+    "@localimage/win32-x64": "0.1.0"
+  },
+  "peerDependencies": {
+    "playwright-core": ">=1.40"
+  },
+  "peerDependenciesMeta": {
+    "playwright-core": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  },
+  "keywords": [
+    "browser",
+    "playwright",
+    "puppeteer",
+    "docker",
+    "e2e",
+    "testing",
+    "live-view",
+    "vnc",
+    "webrtc",
+    "headful"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LocalImages/LocalImage.git",
+    "directory": "packages/npm"
+  },
+  "homepage": "https://github.com/LocalImages/LocalImage#readme",
+  "bugs": {
+    "url": "https://github.com/LocalImages/LocalImage/issues"
+  }
+}

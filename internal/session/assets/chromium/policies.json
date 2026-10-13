@@ -1,0 +1,13 @@
+{
+  "BrowserSignin": 0,
+  "DefaultCookiesSetting": 1,
+  "CommandLineFlagSecurityWarningsEnabled": false,
+  "SyncDisabled": true,
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "DefaultNotificationsSetting": 2,
+  "BookmarkBarEnabled": false,
+  "BrowserAddPersonEnabled": false,
+  "PromptForDownloadLocation": false
+}

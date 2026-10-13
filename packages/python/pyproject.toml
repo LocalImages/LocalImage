@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "localimage"
+version = "0.1.0"
+description = "Run headful browsers in Docker with live view, locally. CLI + SDK."
+readme = "../../README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+dependencies = []
+keywords = ["browser", "playwright", "docker", "e2e", "testing", "live-view"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/LocalImages/LocalImage"
+Source = "https://github.com/LocalImages/LocalImage"
+Issues = "https://github.com/LocalImages/LocalImage/issues"
+
+[project.scripts]
+localimage = "localimage.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/localimage"]

@@ -1,0 +1,100 @@
+name: Release
+
+# Push a tag like v0.2.0 (it must equal the contents of the VERSION file).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build release artifacts
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match VERSION
+        run: |
+          if [ "v$(cat VERSION)" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match VERSION $(cat VERSION)"; exit 1
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release # add required reviewers to this environment for a manual approval step
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish platform packages, then the main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for d in dist/npm/*-*/; do (cd "$d" && npm publish --access public); done
+          (cd dist/npm/localimage && npm publish --access public)
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # PyPI trusted publishing; no token needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/wheels/
+
+  github-release:
+    name: GitHub release
+    needs: [publish-npm, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Collect binaries and checksums
+        run: |
+          mkdir release
+          for d in dist/bin/*/; do
+            name="$(basename "$d")"
+            f="$(ls "$d")"
+            ext=""; case "$f" in *.exe) ext=".exe";; esac
+            cp "$d/$f" "release/localimage-$name$ext"
+          done
+          (cd release && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

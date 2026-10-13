@@ -1,0 +1,356 @@
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/LocalImages/LocalImage/internal/api"
+	"github.com/LocalImages/LocalImage/internal/session"
+)
+
+const defaultAddr = "127.0.0.1:7777"
+
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+	}
+	addr := os.Getenv("LOCALIMAGE_ADDR")
+	if addr == "" {
+		addr = defaultAddr
+	}
+	switch os.Args[1] {
+	case "help", "-h", "--help":
+		fmt.Print(helpText)
+	case "doctor":
+		doctor(addr)
+	case "version", "--version":
+		fmt.Println(version)
+	case "start":
+		fs := flag.NewFlagSet("start", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "listen address")
+		fs.Parse(os.Args[2:])
+		start(addr)
+	case "create":
+		fs := flag.NewFlagSet("create", flag.ExitOnError)
+		browser := fs.String("browser", "chromium", "browser to run")
+		ttl := fs.Int("ttl", 1800, "session lifetime in seconds")
+		profile := fs.String("profile", "", "named persistent profile (chromium only)")
+		memory := fs.Int("memory", 0, "memory limit in MiB")
+		cpus := fs.Float64("cpus", 0, "CPU limit")
+		kiosk := fs.Bool("kiosk", false, "chromium: fullscreen without tabs or address bar")
+		var exts stringList
+		fs.Var(&exts, "extension", "chromium: uploaded extension to load (repeatable)")
+		fs.Parse(os.Args[2:])
+		body, _ := json.Marshal(map[string]any{
+			"browser": *browser, "ttl_seconds": *ttl,
+			"profile": *profile, "memory_mb": *memory, "cpus": *cpus,
+			"kiosk": *kiosk, "extensions": []string(exts),
+		})
+		call(addr, http.MethodPost, "/v1/sessions", body)
+	case "ls":
+		call(addr, http.MethodGet, "/v1/sessions", nil)
+	case "exec":
+		// localimage exec <id> -- <command> [args...]
+		if len(os.Args) < 5 || os.Args[3] != "--" {
+			usage()
+		}
+		body, _ := json.Marshal(map[string]any{"command": os.Args[4:]})
+		call(addr, http.MethodPost, "/v1/sessions/"+os.Args[2]+"/process/exec", body)
+	case "extension":
+		extension(addr, os.Args[2:])
+	case "profile":
+		if len(os.Args) >= 3 && os.Args[2] == "ls" {
+			call(addr, http.MethodGet, "/v1/profiles", nil)
+		} else if len(os.Args) >= 4 && os.Args[2] == "rm" {
+			call(addr, http.MethodDelete, "/v1/profiles/"+os.Args[3], nil)
+		} else {
+			usage()
+		}
+	case "screenshot":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		fs := flag.NewFlagSet("screenshot", flag.ExitOnError)
+		out := fs.String("o", os.Args[2]+".png", "output file")
+		fs.Parse(os.Args[3:])
+		download(addr, "/v1/sessions/"+os.Args[2]+"/screenshot", *out)
+	case "record":
+		record(addr, os.Args[2:])
+	case "rm":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		call(addr, http.MethodDelete, "/v1/sessions/"+os.Args[2], nil)
+	default:
+		usage()
+	}
+}
+
+const helpText = `localimage - run headful browsers in Docker with live view, locally
+
+Usage: localimage <command> [arguments]
+
+Daemon
+  start [-addr host:port]      run the daemon (default 127.0.0.1:7777)
+  doctor                       check Docker, images and the daemon
+
+Sessions
+  create [flags]               start a browser session and print its URLs
+      -browser chromium|firefox   -ttl seconds   -profile name (chromium)
+      -extension name (repeatable, chromium)   -kiosk (chromium)
+      -memory MiB   -cpus n
+  ls                           list running sessions
+  rm <id>                      delete a session
+  exec <id> -- <cmd...>        run a command inside the session
+  screenshot <id> [-o file]    save a PNG of the display
+  record start|stop <id>       start or stop an MP4 recording
+  record get <id> [-o file]    download the latest recording
+
+Saved state
+  profile ls | profile rm <name>
+  extension upload <name> <dir-or-zip> | extension ls | extension rm <name>
+
+Environment
+  LOCALIMAGE_ADDR              daemon address (default 127.0.0.1:7777)
+  LOCALIMAGE_API_KEY           require this key for the control API
+  LOCALIMAGE_PUBLIC_IP         address clients use for WebRTC media (default 127.0.0.1)
+  LOCALIMAGE_MAX_SESSIONS      concurrent session limit (default 10)
+  LOCALIMAGE_MAX_TTL_SECONDS   longest allowed session lifetime (default 86400)
+`
+
+func usage() {
+	fmt.Fprint(os.Stderr, helpText)
+	os.Exit(2)
+}
+
+// doctor reports whether the environment can run sessions.
+func doctor(addr string) {
+	ok := true
+	pass := func(f string, a ...any) { fmt.Printf("  ok    "+f+"\n", a...) }
+	warn := func(f string, a ...any) { fmt.Printf("  note  "+f+"\n", a...) }
+	fail := func(f string, a ...any) { ok = false; fmt.Printf("  FAIL  "+f+"\n", a...) }
+
+	fmt.Println("localimage", version)
+	mgr, err := session.New()
+	var ver string
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ver, err = mgr.Ping(ctx)
+	}
+	if err != nil {
+		fail("Docker is not reachable: %v", err)
+		fmt.Println("        Install Docker and make sure it is running (try `docker ps`).")
+		fmt.Println("        On Linux your user needs access to the Docker socket (docker group).")
+		os.Exit(1)
+	}
+	pass("Docker %s", ver)
+
+	ctx := context.Background()
+	for _, b := range []string{"chromium", "firefox"} {
+		if mgr.ImageReady(ctx, b) {
+			pass("%s image is built", b)
+		} else {
+			warn("%s image is not built yet; it is built on first use (needs internet, takes 1-4 minutes)", b)
+		}
+	}
+	maxS, maxTTL := mgr.Limits()
+	pass("limits: %d sessions, ttl up to %s", maxS, maxTTL)
+
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get("http://" + addr + "/healthz")
+	if err != nil {
+		warn("daemon is not running at %s (start it with `localimage start`)", addr)
+	} else {
+		resp.Body.Close()
+		pass("daemon is running at %s", addr)
+	}
+	if !strings.HasPrefix(addr, "127.0.0.1") && !strings.HasPrefix(addr, "localhost") && os.Getenv("LOCALIMAGE_API_KEY") == "" {
+		fail("%s is not a loopback address and LOCALIMAGE_API_KEY is not set; anyone who can reach it can run commands in your sessions", addr)
+	}
+	if ok {
+		fmt.Println("ready")
+		return
+	}
+	os.Exit(1)
+}
+
+func start(addr string) {
+	mgr, err := session.New()
+	if err == nil {
+		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err = mgr.Ping(pctx)
+		cancel()
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "localimage: cannot reach Docker: %v\nIs Docker installed and running? Run `localimage doctor` for details.\n", err)
+		os.Exit(1)
+	}
+	if !strings.HasPrefix(addr, "127.0.0.1") && !strings.HasPrefix(addr, "localhost") && os.Getenv("LOCALIMAGE_API_KEY") == "" {
+		fmt.Fprintln(os.Stderr, "localimage: refusing to listen on a non-loopback address without LOCALIMAGE_API_KEY set")
+		os.Exit(1)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	go api.RunReaper(ctx, mgr)
+
+	srv := &http.Server{Addr: addr, Handler: api.New(mgr, os.Getenv("LOCALIMAGE_API_KEY")).Handler()}
+	go func() {
+		<-ctx.Done()
+		sh, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(sh)
+	}()
+	fmt.Println("localimage daemon listening on http://" + addr)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func call(addr, method, path string, body []byte) {
+	req, _ := http.NewRequest(method, "http://"+addr+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if k := os.Getenv("LOCALIMAGE_API_KEY"); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "daemon not reachable (run `localimage start`):", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		fmt.Fprintf(os.Stderr, "%s\n", out)
+		os.Exit(1)
+	}
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, out, "", "  ") == nil {
+		fmt.Println(pretty.String())
+	}
+}
+
+func record(addr string, args []string) {
+	if len(args) < 2 {
+		usage()
+	}
+	action, id := args[0], args[1]
+	switch action {
+	case "start", "stop":
+		call(addr, http.MethodPost, "/v1/sessions/"+id+"/recording/"+action, nil)
+	case "get":
+		fs := flag.NewFlagSet("record get", flag.ExitOnError)
+		out := fs.String("o", id+".mp4", "output file")
+		fs.Parse(args[2:])
+		download(addr, "/v1/sessions/"+id+"/recording", *out)
+	default:
+		usage()
+	}
+}
+
+func download(addr, path, out string) {
+	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+	if k := os.Getenv("LOCALIMAGE_API_KEY"); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "daemon not reachable (run `localimage start`):", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "%s\n", b)
+		os.Exit(1)
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+	n, _ := io.Copy(f, resp.Body)
+	fmt.Printf("saved %s (%d bytes)\n", out, n)
+}
+
+type stringList []string
+
+func (l *stringList) String() string     { return fmt.Sprint([]string(*l)) }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
+// extension manages uploaded Chromium extensions.
+func extension(addr string, args []string) {
+	switch {
+	case len(args) == 1 && args[0] == "ls":
+		call(addr, http.MethodGet, "/v1/extensions", nil)
+	case len(args) == 2 && args[0] == "rm":
+		call(addr, http.MethodDelete, "/v1/extensions/"+args[1], nil)
+	case len(args) == 3 && args[0] == "upload":
+		data, err := zipSource(args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		call(addr, http.MethodPost, "/v1/extensions?name="+url.QueryEscape(args[1]), data)
+	default:
+		usage()
+	}
+}
+
+// zipSource returns the bytes of a zip: the file itself, or a directory zipped up.
+func zipSource(p string) ([]byte, error) {
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return os.ReadFile(p)
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	err = filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(p, path)
+		if err != nil {
+			return err
+		}
+		w, err := zw.Create(filepath.ToSlash(rel))
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(w, f)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Close first: it writes the central directory that buf.Bytes() must include.
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}

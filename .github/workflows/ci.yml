@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: # reused by the release workflow so a tag cannot publish untested code
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "Not gofmt-formatted:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./...
+
+  packages:
+    name: Build and validate packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build binaries, npm packages and wheels
+        run: python3 scripts/package.py
+      - name: Check wheel metadata
+        run: |
+          python3 -m pip install twine
+          twine check dist/wheels/*.whl
+      - name: Check npm packages
+        run: |
+          for d in dist/npm/*/; do (cd "$d" && npm pack --dry-run); done
+
+  e2e:
+    name: End-to-end (Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: go build -o bin/localimage ./cmd/localimage
+      - name: Start the daemon
+        run: |
+          ./bin/localimage doctor || true
+          nohup ./bin/localimage start > daemon.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:7777/healthz && exit 0
+            sleep 1
+          done
+          echo "daemon did not start"; cat daemon.log; exit 1
+      - name: Run end-to-end tests
+        working-directory: packages/npm
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+        run: |
+          npm install
+          npm test
+      - name: Daemon log
+        if: failure()
+        run: cat daemon.log
