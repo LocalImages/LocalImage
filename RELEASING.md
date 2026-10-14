@@ -90,3 +90,21 @@ for d in dist/npm/*-*/; do (cd "$d" && npm publish --access public); done
 (cd dist/npm/localimage && npm publish --access public)
 python3 -m pip install twine && twine upload dist/wheels/*.whl
 ```
+
+## Supply chain
+
+- Every action in the workflows is pinned to a commit (the tag is in a trailing comment), so an
+  action cannot change under the publish secrets without a review. Nothing updates the pins
+  automatically: bump them by hand now and then (look up the commit behind the new tag with
+  `git ls-remote https://github.com/<owner>/<action> 'refs/tags/<tag>^{}'`), or add Dependabot's
+  `github-actions` ecosystem later if you want pull requests for it.
+- On a public repository, `npm publish` records provenance and the release binaries get a signed
+  attestation (`gh attestation verify <file> --repo LocalImages/LocalImage`). Both are skipped on a
+  private repository, where they would fail.
+
+## Third-party notices
+
+The binary bundles open-source Go modules, so every package and the GitHub release include
+`THIRD_PARTY_NOTICES.md` with their licences. Regenerate it whenever `go.mod` changes:
+`go install github.com/google/go-licenses@latest`, then `go-licenses report ./cmd/localimage` to review the
+licences (anything that is not permissive needs a decision) and `go-licenses save` for the texts.

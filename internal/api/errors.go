@@ -17,6 +17,7 @@ import (
 //	conflict            409  the request clashes with current state (e.g. profile in use)
 //	image_not_ready     409  noBuild was set and the browser image is not built (see prepare)
 //	unauthorized        401  missing or wrong API key
+//	forbidden           403  the Host or Origin of the request is not allowed (see LOCALIMAGE_ALLOWED_HOSTS)
 //	docker_unavailable  503  the daemon cannot reach Docker
 //	not_found           404  some other resource does not exist
 //	internal            500  anything else
@@ -55,6 +56,10 @@ func classify(err error, fallback int) (status int, code string, details any) {
 		return fallback, "not_found", nil
 	case http.StatusConflict:
 		return fallback, "conflict", nil
+	case http.StatusForbidden:
+		return fallback, "forbidden", nil
+	case http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType:
+		return fallback, "invalid_request", nil
 	case http.StatusTooManyRequests:
 		return fallback, "limit_exceeded", nil
 	}

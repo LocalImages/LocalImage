@@ -8,6 +8,7 @@
  *   conflict            clashes with current state (for example a profile already in use)
  *   image_not_ready     noBuild was set and the browser image is not built yet (see prepare())
  *   unauthorized        missing or wrong API key
+ *   forbidden           the request's Host or Origin is not allowed (LOCALIMAGE_ALLOWED_HOSTS)
  *   docker_unavailable  the daemon cannot reach Docker
  *   not_found, internal
  *
@@ -17,6 +18,7 @@
  *   daemon_start_failed ensureDaemon could not start the daemon (the message has its log)
  *   binary_not_found    there is no localimage binary for this platform
  *   request_timeout     the call exceeded its `timeoutMs`
+ *   incompatible_daemon assertCompatible() found a daemon this SDK cannot talk to
  *
  * An aborted call (an AbortSignal fired) rejects with the signal's reason, normally an
  * AbortError, not a LocalImageError, so callers can tell "I cancelled" from "it failed".
@@ -43,6 +45,7 @@ export const ERROR_CODES = Object.freeze([
   'conflict',
   'image_not_ready',
   'unauthorized',
+  'forbidden',
   'docker_unavailable',
   'not_found',
   'internal',
@@ -51,4 +54,5 @@ export const ERROR_CODES = Object.freeze([
   'daemon_start_failed',
   'binary_not_found',
   'request_timeout',
+  'incompatible_daemon',
 ]);

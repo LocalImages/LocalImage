@@ -157,7 +157,7 @@ t('delete is idempotent: releasing twice, concurrently, or after a failed acquir
   assert.deepEqual([...both].sort(), [false, true], 'racing deletes: exactly one removes it, neither throws');
 
   // The raw API says the same thing with a stable code.
-  const r = await fetch(`http://${ADDR}/v1/sessions/${s2.id}`, { method: 'DELETE' });
+  const r = await fetch(`http://${ADDR}/v1/sessions/${s2.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${li.apiKey}` } });
   assert.equal(r.status, 404);
   assert.equal((await r.json()).code, 'session_gone');
 });
@@ -306,4 +306,55 @@ t('reconnect: firefox sessions survive a drop, but pages opened by the old conne
   } finally {
     await li.delete(lease.id);
   }
+});
+
+t('ensureDaemon from several processes at once: one daemon, and only its starter says it started it', async () => {
+  const addr = '127.0.0.1:7790';
+  assert.equal(await fetch(`http://${addr}/healthz`).then(() => true, () => false), false, `port ${addr} is in use`);
+  const { spawn } = await import('node:child_process');
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () =>
+      new Promise((resolve, reject) => {
+        const p = spawn('node', [FIXTURES + 'ensure.mjs', addr], { env: process.env });
+        let out = '';
+        p.stdout.on('data', (d) => (out += d));
+        p.on('close', (code) => (code === 0 ? resolve(JSON.parse(out.trim().split('\n').pop())) : reject(new Error(`exit ${code}: ${out}`))));
+      }),
+    ),
+  );
+  try {
+    assert.equal(results.filter((r) => r.started).length, 1, `exactly one process owns the daemon: ${JSON.stringify(results)}`);
+    const health = await (await fetch(`http://${addr}/healthz`)).json();
+    assert.equal(results.find((r) => r.started).pid, health.pid, 'and its pid is the daemon that is answering');
+  } finally {
+    await new LocalImage({ addr }).shutdown();
+  }
+});
+
+t('the daemon log records what happened, including refused requests, and never a session token', async () => {
+  const log = await daemon();
+  const { readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { request } = await import('node:http');
+  const file = log.logFile ?? join(tmpdir(), 'localimage-daemon-127.0.0.1_7791.log');
+  const read = () => readFileSync(file, 'utf8');
+
+  const s = await li.create({ ttlSeconds: 300 });
+  const token = s.connectUrl.split('/t/')[1].split('/')[0];
+  // A cross-site request, and a request that reaches a session through its token path.
+  await new Promise((resolve) => {
+    const r = request({ host: '127.0.0.1', port: 7791, method: 'POST', path: `/t/${token}/cdp/json/version`, headers: { Origin: 'http://evil.example' } }, (res) => { res.resume(); res.on('end', resolve); });
+    r.end();
+  });
+  await fetch(`${s.connectUrl}/json/version`);
+  await s.close();
+  await sleep(300);
+
+  const text = read();
+  assert.match(text, /msg="session created" id=/, 'creation is logged');
+  assert.match(text, /msg="session deleted" id=/, 'deletion is logged');
+  assert.match(text, /msg="request refused" reason="cross-origin/, 'a refused request is logged with its reason');
+  assert.ok(text.includes('/t/<redacted>/cdp/json/version'), 'token paths are redacted');
+  assert.ok(!text.includes(token), 'the session token never reaches the log');
 });

@@ -148,7 +148,8 @@ ensure_daemon(env={"LOCALIMAGE_MAX_SESSIONS": "20"})
 li = LocalImage(auto_start=True)                                   # or LOCALIMAGE_AUTOSTART=1
 ```
 
-A running daemon is always reused; racing callers end up sharing one. A daemon started this way is
+A running daemon is always reused; racing callers, even in separate processes, end up sharing one, and
+only the process that really started it gets `started: true`. A daemon started this way is
 detached, so it outlives the process and is shared by parallel workers. `env` only affects a daemon
 that is started here. Stop it with `localimage stop` (or `li.shutdown()`); sessions keep running
 until their TTL passes. If it cannot start you get a clear error (see codes below), not a hang.
@@ -188,12 +189,14 @@ provider can map errors without parsing messages:
 | `docker_unavailable` | the daemon cannot reach Docker |
 | `image_not_ready` | `noBuild` was set and the browser image is not built (see `prepare`) |
 | `request_timeout` | the call exceeded its `timeoutMs` / `timeout` |
+| `incompatible_daemon` | `assertCompatible` found a daemon this SDK cannot talk to |
 | `binary_not_found` | there is no localimage binary for this platform |
 | `limit_exceeded` | too many sessions, or a ttl over the limit. `details` has `{max, running}` |
 | `session_gone` | the session does not exist (deleted, expired, never created) |
 | `invalid_request` | malformed request, or it names something that does not exist |
 | `conflict` | clashes with current state (for example a profile already in use) |
 | `unauthorized` | missing or wrong API key |
+| `forbidden` | the request's `Host` or `Origin` is not allowed (see Security model) |
 | `not_found` | some other resource does not exist |
 | `internal` | anything else the daemon reports |
 | `http_<status>` | a response that was not the daemon's own JSON error (for example from a proxy) |
@@ -287,6 +290,108 @@ another process. Verified for **Chromium** with real separate processes:
 closes the pages a connection opened when that connection ends, so the new connection starts without
 them. For Firefox, keep one connection for the whole attempt.
 
+### Acting on a session by id
+
+`create` is not the only way to get a `Session`. From another process, after a restart, or from a stored
+lease, `attach` builds the same object from just the id:
+
+```js
+const s = await new LocalImage().attach(lease.id);   // rejects with `session_gone` if it is not there
+await s.downloadFile(`${s.downloadsDir}/report.pdf`);
+const { replay_id } = await s.startRecording();      // and so on: everything create() returns works
+```
+
+A stopped session can be attached too, which is how you find out why it died: `await s.logs()`.
+
+### Logs
+
+`session.logs({ source, tail })` returns the end of a log as text. `source` is `container` (Docker's
+capture of the container's output, the default), `chromium`, `firefox` (the Playwright server), `neko`,
+`xorg`, `openbox`, `pulseaudio` or `cdp-forward`; `tail` is a number of lines (default 200, at most
+5000). It works for stopped containers, so a crashed session leaves something to debug with.
+
+### Reaching an app on your machine
+
+The browser runs in a container, so `localhost` there is the container. Every session maps
+`host.docker.internal` to the host, so an app on your machine is reachable as
+`http://host.docker.internal:<port>/` **if it listens on a non-loopback address** (`0.0.0.0`, or your
+machine's address). Most dev servers listen on `127.0.0.1` by default, and **a service bound only to
+the host's loopback cannot be reached from any container, whatever name you use** (verified). Start the
+server with its host option set to `0.0.0.0` (for example `--host 0.0.0.0`), and treat that as exposing
+it to your network while it runs. Docker Desktop (macOS, Windows) provides `host.docker.internal` itself
+and reaches loopback services; that is untested here.
+
+### Versions and compatibility
+
+The browser images are built from **base images pinned by digest**, so every machine gets the same
+browser. `info()` reports what is inside, and `assertCompatible` checks it:
+
+```js
+await li.assertCompatible({ chromium: /^154\./ });   // rejects with `incompatible_daemon` if not
+const { version, apiVersion, components } = await li.info();   // components.chromium.version, ...
+```
+
+| localimage | daemon API | Chromium | Firefox | Playwright (Firefox only) |
+|---|---|---|---|---|
+| 0.3.x | 1 | 154.0.8037.57 | 155.0 | 1.63.0 |
+
+The SDK and the daemon speak API revision `SUPPORTED_API_VERSION`; `assertCompatible` rejects a daemon
+that does not. Chromium is driven over CDP, so a different Playwright client version also works with it;
+Firefox needs the exact Playwright version in the table.
+
+### Browser crashes and health
+
+If the browser inside a session crashes it comes back by itself within a second, on the **same URL**,
+but as a **new, empty browser**: your connection drops and every page is gone. Nothing else changes,
+so a client needs a way to notice:
+
+```js
+const { starts, restarts, health, last_started_at } = await session.health();
+// restarts > 0: the browser crashed and was restarted. health: starting | healthy | unhealthy
+```
+
+`list()` entries carry `health` too. The Docker health check covers the browser as well as the live view.
+
+### Changing tags later
+
+Tags given at creation are Docker labels and cannot change, so later changes are kept alongside them
+and merged on every read: `await session.updateTags({ set: { stage: 'failed' }, remove: ['tmp'] })`.
+`list({ tags })` and `attach` see the current tags, so an engine can mark attempts as it goes.
+
+### Logs outlive a crash, not the session
+
+A session's logs vanish with its container. `await session.saveLogs('./artifacts')` writes every source
+to `./artifacts/<id>/<source>.log`; call it when a test fails, before `close()`.
+
+### WebGL, timezone and language
+
+`create({ webgl: true })` turns on WebGL through software rendering (Chromium only; it costs CPU and is
+off by default). `timezone: 'Europe/Berlin'` sets the browser's timezone (the page may report a legacy
+alias of the same zone, such as `Asia/Calcutta`); `locale: 'de-DE'` sets its language (Chromium only).
+For Firefox, set `timezoneId` and `locale` on the Playwright context.
+
+### Recording limits
+
+A recording stops by itself after `maxSeconds` (default 3600, at most 4 hours; the default is
+`LOCALIMAGE_MAX_RECORDING_SECONDS`), so a forgotten one cannot fill the container's disk.
+
+### Disk, memory and capacity
+
+Each browser image is about 1.6 GB. Old revisions left by earlier versions pile up; `localimage prune`
+(or `await li.prune()`) removes them, and `info().staleImages` and `localimage doctor` report them.
+An idle session uses about 300 MiB of memory and 1–2% of a CPU, more with pages open, so the default
+limit of 10 sessions needs roughly 3 GB. Ten sessions start in parallel in about 9 seconds.
+
+To reproduce the same `apt` packages when building images, set `LOCALIMAGE_APT_SNAPSHOT` (a Debian
+snapshot timestamp such as `20261001T000000Z`) for the daemon. It is off by default because
+snapshot.debian.org can be slow.
+
+### The daemon's log
+
+The daemon logs session creation and removal, failures and refused requests to stderr (a file when
+`ensureDaemon` started it: its path is in the result). `LOCALIMAGE_LOG_LEVEL=debug` adds every API call.
+Session tokens are redacted.
+
 ### Downloads
 
 Downloads go to `session.downloadsDir` (`/home/neko/Downloads`), which exists, belongs to the browser
@@ -350,6 +455,11 @@ localimage start [-addr host:port]     run the daemon (default 127.0.0.1:7777)
 localimage stop                        stop the daemon (sessions keep running until their TTL)
 localimage doctor                      check Docker, images and the daemon
 localimage pull [chromium|firefox ...] build the browser images now (default: chromium)
+localimage prune                       remove browser images left by older versions
+localimage get|health|recordings <id>  show a session, its browser health, its recordings
+localimage logs <id> [-source s] [-tail n]
+localimage download <id> <path> [-o file] | upload <id> <file> <path>
+localimage tag <id> -set k=v -remove k
 localimage info                        the daemon's version, limits and current load
 localimage create [flags]              start a session (-tag key=value, -wait seconds, ...)
 localimage ls [-tag key=value ...]     list sessions (all states), optionally filtered by tag
@@ -370,7 +480,11 @@ The daemon exposes a JSON API (default `http://127.0.0.1:7777`):
 | | |
 |---|---|
 | `POST/GET /v1/sessions`, `GET/DELETE /v1/sessions/{id}` | create (`tags`, `wait_seconds`), list (`?tag=key=value`, repeatable), inspect, delete |
-| `GET /v1/info` | version, `max_sessions`, `max_ttl_seconds`, `running`, `available` |
+| `GET /v1/info` | version, `api_version`, `components` (browser versions), `images`, `max_sessions`, `max_ttl_seconds`, `running`, `available` |
+| `GET /v1/sessions/{id}/health` | container state, Docker health, browser starts and restarts |
+| `PATCH /v1/sessions/{id}/tags` | `{set, remove}`: change tags after creation |
+| `POST /v1/images/prune` | remove browser image tags left by older versions |
+| `GET /v1/sessions/{id}/logs?source=&tail=` | the end of a session's log, as text; works for stopped sessions |
 | `POST /v1/shutdown` | stop the daemon |
 | `POST /v1/images/prepare` | build missing browser images; streams newline-delimited JSON progress |
 | `POST /v1/sessions/{id}/recording/start`, `.../stop`; `GET .../recording`, `.../recordings[/{rid}]` | recordings |
@@ -380,7 +494,7 @@ The daemon exposes a JSON API (default `http://127.0.0.1:7777`):
 | `PUT/GET /v1/sessions/{id}/files?path=`, `GET .../files/list?path=` | file I/O |
 | `POST/GET /v1/extensions`, `DELETE /v1/extensions/{name}` | extensions (zip upload) |
 | `GET /v1/profiles`, `DELETE /v1/profiles/{name}` | profiles |
-| `GET /healthz` | liveness |
+| `GET /healthz` | liveness: `{"ok": true, "pid": N}` |
 
 Errors are JSON, `{"error": "<message>", "code": "<code>", "details": {...}}`, with the codes in the
 table above.
@@ -389,8 +503,14 @@ table above.
 
 | Variable | Default | |
 |---|---|---|
+| `LOCALIMAGE_BIN` | the installed binary | path of a `localimage` binary to use instead of the one in the installed package (development) |
 | `LOCALIMAGE_ADDR` | `127.0.0.1:7777` | daemon address (CLI and SDKs) |
-| `LOCALIMAGE_API_KEY` | unset | if set, the control API requires `Authorization: Bearer <key>` |
+| `LOCALIMAGE_API_KEY` | generated file | the control API key; by default a private key file is created and read by the CLI and SDKs |
+| `LOCALIMAGE_NO_AUTH` | unset | `1` turns authentication off |
+| `LOCALIMAGE_ALLOWED_HOSTS`, `LOCALIMAGE_ALLOWED_ORIGINS` | unset | extra Host names / browser origins the daemon accepts |
+| `LOCALIMAGE_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `LOCALIMAGE_MAX_RECORDING_SECONDS` | `3600` | default recording limit |
+| `LOCALIMAGE_APT_SNAPSHOT` | unset | build images from a dated Debian snapshot |
 | `LOCALIMAGE_AUTOSTART` | unset | `1` makes the SDK clients start the daemon on first use |
 | `LOCALIMAGE_PUBLIC_IP` | `127.0.0.1` | address clients use for WebRTC media (see below) |
 | `LOCALIMAGE_MAX_SESSIONS` | `10` | concurrent sessions allowed |
@@ -398,17 +518,36 @@ table above.
 
 ## Security model
 
+- **The control API is authenticated by default.** On first start the daemon generates a random key
+  and keeps it in a file only your user can read (`~/.config/localimage/api-key`, or the platform's
+  equivalent). The CLI and both SDKs read the same file, so you configure nothing; other users on the
+  machine cannot call the daemon. Set `LOCALIMAGE_API_KEY` to choose your own key (for `curl`, send
+  `Authorization: Bearer <key>`), or `LOCALIMAGE_NO_AUTH=1` to turn authentication off (not
+  recommended). `/healthz` and the live-view token URLs do not use the key.
+- **Web pages cannot drive the daemon.** Any page you visit could otherwise send requests to
+  `http://127.0.0.1:7777`. The daemon refuses a request whose `Host` is not an IP address or
+  `localhost` (the DNS-rebinding case), any request carrying a foreign `Origin`, and writes with a
+  content type a browser can send without a preflight. All are `403 forbidden` (or 415) and are logged.
+  `LOCALIMAGE_ALLOWED_HOSTS` and `LOCALIMAGE_ALLOWED_ORIGINS` (comma separated) add exceptions.
 - The daemon listens on **loopback only** by default and **refuses to listen on any other address
-  unless `LOCALIMAGE_API_KEY` is set**.
+  unless `LOCALIMAGE_API_KEY` is set**. Requests have size limits (1 MiB of JSON) and the server has
+  timeouts.
 - Each session has a random secret in its URLs. `connect_url` and `live_url` give full control of
   the browser; `view_url` uses a different secret and a viewer login that cannot control anything
-  and cannot reach CDP. **Treat these URLs like passwords.**
+  and cannot reach CDP. **Treat these URLs like passwords.** The daemon log never contains them.
 - Anyone with the API key can run commands and read files in your session containers. Sessions are
   containers, not a hardened sandbox for hostile code.
 - WebRTC video cannot go through the HTTP proxy: each session also opens one media port on the
   host (the same number inside and outside the container).
-- Sessions are not encrypted on the wire: there is no TLS. Do not expose the daemon to untrusted
-  networks.
+- There is no TLS. Do not expose the daemon to untrusted networks.
+- The release workflow pins every action to a commit (updated by hand), publishes npm
+  packages with provenance, and attests the release binaries, on public repositories.
+
+### Upgrading from 0.2.x
+
+Authentication is now on by default. The CLI and SDKs need no change. Anything else that called the
+API directly (`curl`, another language) must send the key: `-H "Authorization: Bearer $(cat
+~/.config/localimage/api-key)"` and `-H "Content-Type: application/json"` for writes.
 
 ## Troubleshooting
 
@@ -422,10 +561,19 @@ table above.
 
 ## Status
 
-Early (0.x). Tested end to end on Linux x64 with Docker: both browsers, live view video and
-control in Chrome, read-only enforcement, recordings, profiles, extensions, exec and files.
-The macOS and Windows builds compile but have not been run. Not implemented: warm browser pools,
-standby/resume, stealth and proxy options, WebKit, TLS, multi-host scaling.
+Early (0.x). Tested end to end on **Linux x64** with Docker: both browsers, live view video and control
+in Chrome, read-only enforcement, recordings, profiles, extensions, exec and files, tags, reconnecting
+across processes and daemon restarts, cancellation, browser-crash recovery, the authentication and
+cross-site protections, the CLI, and the TypeScript declarations. File uploads to forms work from the
+client machine (a local path or a buffer; a path inside the container does not).
+
+Known limits:
+
+- **macOS and Windows** builds compile but have not been run, and Docker Desktop's networking differs.
+- **An app listening only on `127.0.0.1`** cannot be reached from the browser (see
+  "Reaching an app on your machine").
+- **Firefox** loses its pages when a connection ends; it has no WebGL option, locale option or kiosk mode.
+- No TLS, warm browser pools, standby, stealth or proxy options, WebKit, or multi-host scaling.
 
 ## Development
 

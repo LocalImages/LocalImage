@@ -30,6 +30,8 @@ export interface SessionInfo {
   downloads_dir: string;
   /** Docker state: `running`, `exited`, `created`, ... A crashed worker can leave `exited` ones. */
   state: string;
+  /** Docker's verdict from a check covering the live view and the browser. */
+  health?: 'starting' | 'healthy' | 'unhealthy' | undefined;
   /** RFC 3339 timestamps. */
   created_at: string;
   expires_at: string;
@@ -45,6 +47,12 @@ export interface Info {
   available: number;
   /** Which browser images are built; a missing one is built on first use (see prepare()). */
   images: Partial<Record<BrowserName, boolean>>;
+  /** Old browser images on disk; prune() removes them. */
+  staleImages: number;
+  /** The daemon's API revision. assertCompatible() checks it against SUPPORTED_API_VERSION. */
+  apiVersion: number;
+  /** The browser versions inside the images, for example `{ chromium: { version: '154.0.8037.57' } }`. */
+  components: Partial<Record<BrowserName, { version: string; playwright?: string | undefined }>>;
 }
 
 export interface CreateOptions extends CallOptions {
@@ -64,6 +72,12 @@ export interface CreateOptions extends CallOptions {
   extensions?: string[] | undefined;
   /** Up to 20 key/value pairs stored on the session; filter list() by them. */
   tags?: Record<string, string> | undefined;
+  /** Enable WebGL through software rendering. Chromium only. */
+  webgl?: boolean | undefined;
+  /** Browser timezone, an IANA name such as `Europe/Berlin`. Default UTC. */
+  timezone?: string | undefined;
+  /** Browser language, such as `de-DE`. Chromium only (set it on the Playwright context for Firefox). */
+  locale?: string | undefined;
   /** Queue for a free session slot for this many seconds instead of failing at once. */
   waitSeconds?: number | undefined;
   /** Fail with `image_not_ready` instead of building a missing browser image. */
@@ -178,3 +192,18 @@ export interface ScreenshotRegion {
 }
 
 export type MouseButton = 'left' | 'middle' | 'right';
+
+/** Which of a session's logs to read. `container` is Docker's capture of its output. */
+export type LogSource = 'container' | 'chromium' | 'firefox' | 'neko' | 'xorg' | 'openbox' | 'pulseaudio' | 'cdp-forward';
+
+/** Whether a session's browser is up, and whether it has restarted. */
+export interface BrowserHealth {
+  state: string;
+  health?: 'starting' | 'healthy' | 'unhealthy' | undefined;
+  /** How many times the browser has started (1 after a normal launch). */
+  starts: number;
+  /** `starts - 1`: how often it crashed and came back as a new, empty browser. */
+  restarts: number;
+  last_started_at?: string | undefined;
+  last_started_at_ms?: number | undefined;
+}

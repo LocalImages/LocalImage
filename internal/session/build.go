@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -42,12 +43,12 @@ func (m *Manager) buildImage(ctx context.Context, name, tag string, onLog func(s
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "localimage: building %s (first use only, this can take a few minutes)\n", tag)
+	slog.Info("building image (first use only; this can take a few minutes)", "image", tag)
 	resp, err := m.cli.ImageBuild(ctx, &buf, build.ImageBuildOptions{
 		Tags:       []string{tag},
 		Dockerfile: "Dockerfile",
 		Remove:     true,
-		BuildArgs:  map[string]*string{"PW_VERSION": strPtr(PlaywrightVersion)},
+		BuildArgs:  buildArgs(),
 	})
 	if err != nil {
 		return err
@@ -84,3 +85,14 @@ func (m *Manager) buildImage(ctx context.Context, name, tag string, onLog func(s
 }
 
 func strPtr(s string) *string { return &s }
+
+// buildArgs are the Dockerfile arguments: the pinned Playwright version, and, if
+// LOCALIMAGE_APT_SNAPSHOT is set (for example 20260930T000000Z), the Debian snapshot to install
+// packages from.
+func buildArgs() map[string]*string {
+	args := map[string]*string{"PW_VERSION": strPtr(PlaywrightVersion)}
+	if snap := os.Getenv("LOCALIMAGE_APT_SNAPSHOT"); snap != "" {
+		args["APT_SNAPSHOT"] = strPtr(snap)
+	}
+	return args
+}

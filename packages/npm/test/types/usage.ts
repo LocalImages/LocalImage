@@ -22,6 +22,7 @@ function describe(code: LocalImageErrorCode): string {
     case 'conflict':
     case 'image_not_ready':
     case 'unauthorized':
+    case 'forbidden':
     case 'docker_unavailable':
     case 'not_found':
     case 'internal':
@@ -29,6 +30,7 @@ function describe(code: LocalImageErrorCode): string {
     case 'daemon_start_failed':
     case 'binary_not_found':
     case 'request_timeout':
+    case 'incompatible_daemon':
       return code;
     default: {
       const rest: `http_${number}` = code;
@@ -73,6 +75,14 @@ async function main(signal: AbortSignal, maybeTags: Record<string, string> | und
   const run = await s.exec(['echo', 'hi'], { cwd: '/tmp', timeoutSeconds: 5 });
   const code: number = run.exit_code;
   await s.click(10, 20, { button: 'left', numClicks: 2 });
+  const h = await s.health({ signal });
+  const restarts: number = h.restarts;
+  const tags2: Record<string, string> = await s.updateTags({ set: { status: 'failed' }, remove: ['old'] });
+  const saved: string[] = await s.saveLogs('/tmp/logs');
+  const limited: RecordingInfo = await s.startRecording({ maxSeconds: 60 });
+  const removed: string[] = await li.prune();
+  const wg: CreateOptions = { webgl: true, timezone: 'Europe/Berlin', locale: 'de-DE' };
+  void [restarts, tags2, saved, limited, removed, wg];
   const closed: boolean = await s.close({ signal });
 
   try {
@@ -117,11 +127,12 @@ const SESSION_KEYS = [
   'id', 'browser', 'protocol', 'connectUrl', 'liveUrl', 'viewUrl', 'profile', 'extensions', 'tags',
   'downloadsDir', 'expiresAt', 'connect', 'screenshot', 'click', 'moveMouse', 'type', 'pressKey', 'scroll',
   'drag', 'startRecording', 'stopRecording', 'recordings', 'downloadRecording', 'exec', 'uploadFile',
-  'downloadFile', 'listFiles', 'close',
+  'downloadFile', 'listFiles', 'close', 'logs', 'health', 'updateTags', 'saveLogs',
 ] as const;
 const CLIENT_KEYS = [
   'addr', 'apiKey', 'autoStart', 'daemonEnv', 'ensureDaemon', 'shutdown', 'info', 'assertCapacity', 'prepare',
   'create', 'list', 'delete', 'uploadExtension', 'extensions', 'deleteExtension', 'profiles', 'deleteProfile',
+  'attach', 'assertCompatible', 'prune',
 ] as const;
 type Undeclared<T, K extends PropertyKey> = Exclude<keyof T, K>; // declared but not in the list
 type Unimplemented<T, K extends PropertyKey> = Exclude<K, keyof T>; // in the list but not declared

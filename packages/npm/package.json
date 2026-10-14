@@ -1,6 +1,6 @@
 {
   "name": "localimage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run headful browsers in Docker with live view, locally. CLI + SDK.",
   "license": "Apache-2.0",
   "type": "module",
@@ -16,11 +16,11 @@
     "src"
   ],
   "optionalDependencies": {
-    "@localimage/linux-x64": "0.2.0",
-    "@localimage/linux-arm64": "0.2.0",
-    "@localimage/darwin-x64": "0.2.0",
-    "@localimage/darwin-arm64": "0.2.0",
-    "@localimage/win32-x64": "0.2.0"
+    "@localimage/linux-x64": "0.3.0",
+    "@localimage/linux-arm64": "0.3.0",
+    "@localimage/darwin-x64": "0.3.0",
+    "@localimage/darwin-arm64": "0.3.0",
+    "@localimage/win32-x64": "0.3.0"
   },
   "peerDependencies": {
     "playwright-core": ">=1.40"

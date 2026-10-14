@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -52,9 +53,16 @@ const (
 	// matching playwright-core minor version to connect.
 	PlaywrightVersion = "1.63.0"
 
+	// APIVersion changes when the daemon's HTTP API changes incompatibly; SDKs check it.
+	APIVersion = 1
+
+	// Browser versions inside the pinned images. A test checks them against the real browsers.
+	ChromiumVersion = "154.0.8037.57"
+	FirefoxVersion  = "155.0" // the Firefox build that Playwright PlaywrightVersion (1.63.0) ships
+
 	// Image revisions are bumped when the matching assets/ change, forcing a rebuild.
-	chromiumRev = "r7"
-	firefoxRev  = "r4"
+	chromiumRev = "r11"
+	firefoxRev  = "r7"
 )
 
 // Protocol says how automation clients attach to a session.
@@ -90,6 +98,7 @@ type Record struct {
 	Extensions  []string
 	Tags        map[string]string
 	State       string // Docker state: created, running, exited, ...
+	Health      string // Docker health: starting, healthy, unhealthy ("" if unknown)
 	CreatedAt   time.Time
 }
 
@@ -106,10 +115,12 @@ type Session struct {
 	Extensions []string          `json:"extensions,omitempty"`
 	Tags       map[string]string `json:"tags,omitempty"`
 	// DownloadsDir is where the browser saves downloads; read files with the files API.
-	DownloadsDir string    `json:"downloads_dir"`
-	State        string    `json:"state"`
-	CreatedAt    time.Time `json:"created_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	DownloadsDir string `json:"downloads_dir"`
+	State        string `json:"state"`
+	// Health is Docker's verdict from a check covering the live view and the browser.
+	Health    string    `json:"health,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // View renders the record for a client that reached the daemon at host.
@@ -131,6 +142,7 @@ func (r *Record) View(host string) *Session {
 		Tags:         r.Tags,
 		DownloadsDir: "/home/neko/Downloads",
 		State:        r.State,
+		Health:       r.Health,
 		CreatedAt:    r.CreatedAt,
 		ExpiresAt:    r.ExpiresAt,
 	}
@@ -148,7 +160,15 @@ type CreateOptions struct {
 	Tags       map[string]string // caller metadata, stored as Docker labels
 	Wait       time.Duration     // how long to queue for a free slot (0 = fail at once)
 	NoBuild    bool              // fail with ErrNotReady instead of building a missing image
+	WebGL      bool              // chromium: enable WebGL through software rendering
+	Timezone   string            // IANA name, for example Europe/Berlin (default UTC)
+	Locale     string            // browser language, for example de-DE (default en-US)
 }
+
+var (
+	timezoneName = regexp.MustCompile(`^[A-Za-z0-9_+/-]{1,64}$`)
+	localeName   = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
+)
 
 var profileName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,40}$`)
 
@@ -210,6 +230,17 @@ type Info struct {
 	Available     int `json:"available"`
 	// Images says which browser images are already built; a missing one is built on first use.
 	Images map[string]bool `json:"images"`
+	// StaleImages counts browser images left by older versions; `localimage prune` removes them.
+	StaleImages int `json:"stale_images"`
+	// APIVersion is the daemon's API revision; Components says which browser versions the images hold.
+	APIVersion int                  `json:"api_version"`
+	Components map[string]Component `json:"components"`
+}
+
+// Component names a browser the daemon runs and the version inside its image.
+type Component struct {
+	Version    string `json:"version"`
+	Playwright string `json:"playwright,omitempty"` // the Playwright version the server in the image needs
 }
 
 func (m *Manager) Info(ctx context.Context) (*Info, error) {
@@ -224,9 +255,22 @@ func (m *Manager) Info(ctx context.Context) (*Info, error) {
 	if avail < 0 {
 		avail = 0
 	}
-	info := &Info{MaxSessions: m.maxSessions, MaxTTLSeconds: int(m.maxTTL.Seconds()), Running: active, Available: avail}
+	info := &Info{
+		MaxSessions:   m.maxSessions,
+		MaxTTLSeconds: int(m.maxTTL.Seconds()),
+		Running:       active,
+		Available:     avail,
+		APIVersion:    APIVersion,
+		Components: map[string]Component{
+			"chromium": {Version: ChromiumVersion},
+			"firefox":  {Version: FirefoxVersion, Playwright: PlaywrightVersion},
+		},
+	}
 	if m.imagesFn != nil {
 		info.Images = m.imagesFn(ctx)
+	}
+	if m.cli != nil {
+		info.StaleImages = m.StaleImageCount(ctx)
 	}
 	return info, nil
 }
@@ -413,6 +457,15 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 			return nil, invalid("profiles are only supported for chromium")
 		}
 	}
+	if opts.Timezone != "" && !timezoneName.MatchString(opts.Timezone) {
+		return nil, invalid("invalid timezone %q (use an IANA name such as Europe/Berlin)", opts.Timezone)
+	}
+	if opts.Locale != "" && !localeName.MatchString(opts.Locale) {
+		return nil, invalid("invalid locale %q (use a tag such as de-DE)", opts.Locale)
+	}
+	if (opts.WebGL || opts.Locale != "") && spec.protocol != ProtocolCDP {
+		return nil, invalid("webgl and locale are only supported for chromium (for firefox, set them on the Playwright context)")
+	}
 	if (opts.Kiosk || len(opts.Extensions) > 0) && spec.protocol != ProtocolCDP {
 		return nil, invalid("kiosk mode and extensions are only supported for chromium")
 	}
@@ -449,8 +502,10 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	// the container by its name. Docker may have created it even though the call that
 	// asked for it was cancelled, in which case we never learned its ID.
 	succeeded := false
+	startedAt := time.Now()
 	defer func() {
 		if !succeeded {
+			slog.Warn("session create failed; removing its container", "id", id, "browser", opts.Browser)
 			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			_ = m.cli.ContainerRemove(rctx, name, container.RemoveOptions{Force: true, RemoveVolumes: true})
@@ -518,6 +573,15 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 	for k, v := range opts.Tags {
 		cfg.Labels[labelTagPrefix+k] = v
 	}
+	if opts.Timezone != "" {
+		cfg.Env = append(cfg.Env, "TZ="+opts.Timezone)
+	}
+	if opts.WebGL {
+		cfg.Env = append(cfg.Env, "LOCALIMAGE_WEBGL=1")
+	}
+	if opts.Locale != "" {
+		cfg.Env = append(cfg.Env, "LOCALIMAGE_LANG="+opts.Locale)
+	}
 	var chromiumArgs []string
 	if opts.Kiosk {
 		chromiumArgs = append(chromiumArgs, "--kiosk")
@@ -534,6 +598,9 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 		cfg.Env = append(cfg.Env, "LOCALIMAGE_CHROMIUM_ARGS="+strings.Join(chromiumArgs, " "))
 	}
 	host := &container.HostConfig{
+		// Lets the browser reach services on the host that listen on a non-loopback address
+		// (0.0.0.0) as host.docker.internal; Docker Desktop provides the name by itself.
+		ExtraHosts:    []string{"host.docker.internal:host-gateway"},
 		ShmSize:       2 << 30,
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
 		PortBindings: nat.PortMap{
@@ -583,6 +650,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 		m.fitWindow(ctx, created.ID)
 	}
 	succeeded = true
+	slog.Info("session created", "id", id, "browser", opts.Browser, "ms", time.Since(startedAt).Milliseconds())
 	return rec, nil
 }
 
@@ -667,7 +735,16 @@ func (m *Manager) byID(ctx context.Context, id string) (*Record, error) {
 }
 
 // Get returns a session by id.
-func (m *Manager) Get(ctx context.Context, id string) (*Record, error) { return m.byID(ctx, id) }
+func (m *Manager) Get(ctx context.Context, id string) (*Record, error) {
+	rec, err := m.byID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if cid, err := m.findContainer(ctx, labelID+"="+id); err == nil {
+		m.withCurrentTags(ctx, cid, rec)
+	}
+	return rec, nil
+}
 
 // ByViewToken resolves the secret in a read-only /v/ URL to its session.
 func (m *Manager) ByViewToken(ctx context.Context, token string) (*Record, error) {
@@ -709,6 +786,7 @@ func toRecord(info container.InspectResponse) *Record {
 		Extensions:  splitNonEmpty(l[labelExts]),
 		Tags:        tagsFromLabels(l),
 		State:       info.State.Status,
+		Health:      healthOf(info),
 		CreatedAt:   created,
 	}
 }
@@ -717,7 +795,6 @@ func toRecord(info container.InspectResponse) *Record {
 // stopped containers behind), optionally only those carrying all of tags.
 func (m *Manager) List(ctx context.Context, tags map[string]string) ([]*Record, error) {
 	f := filters.NewArgs(filters.Arg("label", labelManaged+"=true"))
-	addTagFilters(f, tags)
 	list, err := m.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
 		return nil, err
@@ -728,9 +805,26 @@ func (m *Manager) List(ctx context.Context, tags map[string]string) ([]*Record, 
 		if err != nil {
 			continue // removed since the list was taken
 		}
-		out = append(out, toRecord(info))
+		rec := toRecord(info)
+		if len(tags) > 0 {
+			// Tags can have been changed since creation, so filter on the current ones.
+			m.withCurrentTags(ctx, c.ID, rec)
+			if !hasAllTags(rec.Tags, tags) {
+				continue
+			}
+		}
+		out = append(out, rec)
 	}
 	return out, nil
+}
+
+func hasAllTags(have, want map[string]string) bool {
+	for k, v := range want {
+		if got, ok := have[k]; !ok || got != v {
+			return false
+		}
+	}
+	return true
 }
 
 // Delete removes a session. It returns ErrNotFound if there is no such
@@ -756,6 +850,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	err = m.cli.ContainerRemove(ctx, cid, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	switch {
 	case err == nil:
+		slog.Info("session deleted", "id", id)
 		return nil
 	case errdefs.IsNotFound(err):
 		return ErrNotFound // a concurrent delete won the race
@@ -812,6 +907,7 @@ func (m *Manager) Reap(ctx context.Context) {
 	}
 	for _, r := range list {
 		if !r.ExpiresAt.IsZero() && time.Now().After(r.ExpiresAt) {
+			slog.Info("session expired", "id", r.ID)
 			_ = m.Delete(ctx, r.ID)
 		}
 	}
@@ -845,4 +941,11 @@ func waitExtensionTarget(ctx context.Context, addr string) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func healthOf(info container.InspectResponse) string {
+	if info.State != nil && info.State.Health != nil {
+		return info.State.Health.Status
+	}
+	return ""
 }

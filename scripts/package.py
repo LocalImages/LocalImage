@@ -71,6 +71,7 @@ def npm_platform_package(os_: str, cpu: str, binary: Path, exe: str) -> None:
     shutil.copy(binary, d / "bin" / exe)
     (d / "bin" / exe).chmod(0o755)
     shutil.copy(ROOT / "LICENSE", d / "LICENSE")
+    shutil.copy(ROOT / "THIRD_PARTY_NOTICES.md", d / "THIRD_PARTY_NOTICES.md")  # the binary bundles these
     (d / "README.md").write_text(
         f"# @localimage/{os_}-{cpu}\n\nPrebuilt `localimage` binary for {os_}-{cpu}. "
         "Install the [`localimage`](https://www.npmjs.com/package/localimage) package instead.\n")
@@ -83,7 +84,7 @@ def npm_platform_package(os_: str, cpu: str, binary: Path, exe: str) -> None:
         "homepage": f"{REPO_URL}#readme",
         "os": [os_],
         "cpu": [cpu],
-        "files": ["bin", "LICENSE", "README.md"],
+        "files": ["bin", "LICENSE", "THIRD_PARTY_NOTICES.md", "README.md"],
         "publishConfig": {"access": "public"},
     }, indent=2) + "\n")
 
@@ -137,6 +138,7 @@ def wheel(plat: str, binary: Path, exe: str) -> Path:
         "\n" + readme)
     files.append((f"{dist_info}/METADATA", metadata.encode(), 0o644))
     files.append((f"{dist_info}/LICENSE", (ROOT / "LICENSE").read_bytes(), 0o644))
+    files.append((f"{dist_info}/THIRD_PARTY_NOTICES.md", (ROOT / "THIRD_PARTY_NOTICES.md").read_bytes(), 0o644))
     files.append((f"{dist_info}/WHEEL", (
         "Wheel-Version: 1.0\nGenerator: localimage-package\n"
         f"Root-Is-Purelib: false\nTag: py3-none-{plat.split('.')[0]}\n"

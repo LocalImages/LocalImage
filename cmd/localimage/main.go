@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/LocalImages/LocalImage/internal/api"
+	"github.com/LocalImages/LocalImage/internal/auth"
 	"github.com/LocalImages/LocalImage/internal/session"
 )
 
@@ -55,6 +57,9 @@ func main() {
 		cpus := fs.Float64("cpus", 0, "CPU limit")
 		kiosk := fs.Bool("kiosk", false, "chromium: fullscreen without tabs or address bar")
 		wait := fs.Int("wait", 0, "seconds to queue for a free session slot (0 = fail at once)")
+		webgl := fs.Bool("webgl", false, "chromium: enable WebGL (software rendering)")
+		timezone := fs.String("timezone", "", "IANA timezone, for example Europe/Berlin")
+		locale := fs.String("locale", "", "browser language, for example de-DE (chromium)")
 		noBuild := fs.Bool("no-build", false, "fail with image_not_ready instead of building a missing browser image")
 		var exts, tags stringList
 		fs.Var(&exts, "extension", "chromium: uploaded extension to load (repeatable)")
@@ -74,6 +79,7 @@ func main() {
 			"profile": *profile, "memory_mb": *memory, "cpus": *cpus,
 			"kiosk": *kiosk, "extensions": []string(exts),
 			"tags": tagMap, "wait_seconds": *wait, "no_build": *noBuild,
+			"webgl": *webgl, "timezone": *timezone, "locale": *locale,
 		})
 		call(addr, http.MethodPost, "/v1/sessions", body)
 	case "ls":
@@ -92,6 +98,55 @@ func main() {
 		call(addr, http.MethodGet, path, nil)
 	case "info":
 		call(addr, http.MethodGet, "/v1/info", nil)
+	case "get", "attach":
+		need(3)
+		call(addr, http.MethodGet, "/v1/sessions/"+os.Args[2], nil)
+	case "health":
+		need(3)
+		call(addr, http.MethodGet, "/v1/sessions/"+os.Args[2]+"/health", nil)
+	case "recordings":
+		need(3)
+		call(addr, http.MethodGet, "/v1/sessions/"+os.Args[2]+"/recordings", nil)
+	case "logs":
+		need(3)
+		fs := flag.NewFlagSet("logs", flag.ExitOnError)
+		source := fs.String("source", "", "container (default), chromium, firefox, neko, xorg, openbox, pulseaudio, cdp-forward")
+		tail := fs.Int("tail", 200, "number of lines")
+		fs.Parse(os.Args[3:])
+		q := url.Values{"tail": {fmt.Sprint(*tail)}}
+		if *source != "" {
+			q.Set("source", *source)
+		}
+		download(addr, "/v1/sessions/"+os.Args[2]+"/logs?"+q.Encode(), "-")
+	case "download":
+		need(4)
+		fs := flag.NewFlagSet("download", flag.ExitOnError)
+		out := fs.String("o", filepath.Base(os.Args[3]), "output file (- for stdout)")
+		fs.Parse(os.Args[4:])
+		download(addr, "/v1/sessions/"+os.Args[2]+"/files?"+url.Values{"path": {os.Args[3]}}.Encode(), *out)
+	case "upload":
+		need(5)
+		upload(addr, os.Args[2], os.Args[3], os.Args[4])
+	case "tag":
+		need(3)
+		fs := flag.NewFlagSet("tag", flag.ExitOnError)
+		var set, remove stringList
+		fs.Var(&set, "set", "key=value to set (repeatable)")
+		fs.Var(&remove, "remove", "key to remove (repeatable)")
+		fs.Parse(os.Args[3:])
+		setMap := map[string]string{}
+		for _, kv := range set {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k == "" {
+				fmt.Fprintf(os.Stderr, "localimage: -set expects key=value, got %q\n", kv)
+				os.Exit(2)
+			}
+			setMap[k] = v
+		}
+		body, _ := json.Marshal(map[string]any{"set": setMap, "remove": []string(remove)})
+		call(addr, http.MethodPatch, "/v1/sessions/"+os.Args[2]+"/tags", body)
+	case "prune":
+		call(addr, http.MethodPost, "/v1/images/prune", nil)
 	case "pull", "prepare":
 		pull(addr, os.Args[2:])
 	case "stop":
@@ -148,6 +203,7 @@ Sessions
       -browser chromium|firefox   -ttl seconds   -profile name (chromium)
       -extension name (repeatable, chromium)   -kiosk (chromium)
       -memory MiB   -cpus n   -tag key=value (repeatable)
+      -webgl (chromium)   -timezone Europe/Berlin   -locale de-DE (chromium)
       -wait seconds           queue for a free slot instead of failing at once
       -no-build               fail with image_not_ready instead of building a missing image
   ls [-tag key=value ...]      list sessions (all states), optionally filtered by tag
@@ -155,7 +211,15 @@ Sessions
   rm <id>                      delete a session
   exec <id> -- <cmd...>        run a command inside the session
   screenshot <id> [-o file]    save a PNG of the display
-  record start|stop <id>       start or stop an MP4 recording
+  record start|stop <id>       start or stop an MP4 recording (start -max seconds, default 3600)
+  recordings <id>              list a session's recordings
+  get <id>                     show one session (URLs, state, health, tags)
+  health <id>                  browser state and how many times it restarted
+  logs <id> [-source s] [-tail n]  the end of a session's log (works for stopped sessions)
+  download <id> <path> [-o file]   read a file from the session (downloads are in /home/neko/Downloads)
+  upload <id> <local file> <path>  copy a file into the session
+  tag <id> -set k=v -remove k  change a session's tags
+  prune                        remove browser images left by older versions
   record get <id> [-o file]    download the latest recording
 
 Saved state
@@ -164,11 +228,24 @@ Saved state
 
 Environment
   LOCALIMAGE_ADDR              daemon address (default 127.0.0.1:7777)
-  LOCALIMAGE_API_KEY           require this key for the control API
+  LOCALIMAGE_API_KEY           the control API key (default: generated into a private file the CLI and
+                               SDKs read; LOCALIMAGE_NO_AUTH=1 turns authentication off)
+  LOCALIMAGE_ALLOWED_HOSTS     extra Host names the daemon answers to (comma separated)
+  LOCALIMAGE_ALLOWED_ORIGINS   extra browser origins allowed to call the API
+  LOCALIMAGE_LOG_LEVEL         debug, info (default), warn or error
+  LOCALIMAGE_MAX_RECORDING_SECONDS  default recording time limit (default 3600)
   LOCALIMAGE_PUBLIC_IP         address clients use for WebRTC media (default 127.0.0.1)
   LOCALIMAGE_MAX_SESSIONS      concurrent session limit (default 10)
   LOCALIMAGE_MAX_TTL_SECONDS   longest allowed session lifetime (default 86400)
 `
+
+// need exits with the usage text unless at least n arguments (including the program name and
+// the command) were given.
+func need(n int) {
+	if len(os.Args) < n {
+		usage()
+	}
+}
 
 func usage() {
 	fmt.Fprint(os.Stderr, helpText)
@@ -206,6 +283,16 @@ func doctor(addr string) {
 			warn("%s image is not built yet; it is built on first use (needs internet, takes 1-4 minutes)", b)
 		}
 	}
+	if n := mgr.StaleImageCount(ctx); n > 0 {
+		warn("%d browser images from older versions are on disk; `localimage prune` removes them", n)
+	}
+	if os.Getenv("LOCALIMAGE_NO_AUTH") == "1" {
+		warn("authentication is off (LOCALIMAGE_NO_AUTH=1): any local process or web page that can reach the daemon can use it")
+	} else if os.Getenv("LOCALIMAGE_API_KEY") == "" {
+		if p, err := auth.Path(); err == nil {
+			pass("API key file: %s", p)
+		}
+	}
 	maxS, maxTTL := mgr.Limits()
 	pass("limits: %d sessions, ttl up to %s", maxS, maxTTL)
 
@@ -226,7 +313,23 @@ func doctor(addr string) {
 	os.Exit(1)
 }
 
+// setupLogging sets the daemon's log level from LOCALIMAGE_LOG_LEVEL (debug, info, warn, error;
+// default info). Lines go to stderr, which `ensureDaemon` captures in the daemon log file.
+func setupLogging() {
+	level := slog.LevelInfo
+	switch strings.ToLower(os.Getenv("LOCALIMAGE_LOG_LEVEL")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+}
+
 func start(addr string) {
+	setupLogging()
 	mgr, err := session.New()
 	if err == nil {
 		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -245,7 +348,26 @@ func start(addr string) {
 	defer stop()
 	go api.RunReaper(ctx, mgr)
 
-	srv := &http.Server{Addr: addr, Handler: api.New(mgr, os.Getenv("LOCALIMAGE_API_KEY"), version, stop).Handler()}
+	key := os.Getenv("LOCALIMAGE_API_KEY")
+	if key == "" && os.Getenv("LOCALIMAGE_NO_AUTH") != "1" {
+		// No key configured: use a generated one in a file only this user can read. The CLI and
+		// SDKs read it too, so nothing needs setting up, but other users and web pages cannot call us.
+		k, err := auth.LoadOrCreate()
+		if err != nil {
+			// Never fall back to an open API silently: that would turn the protection off exactly
+			// when something unusual (no home directory, a read-only disk) is going on.
+			fmt.Fprintf(os.Stderr, "localimage: cannot set up the API key file (%v).\nSet LOCALIMAGE_API_KEY to a key of your choice, or LOCALIMAGE_NO_AUTH=1 to run without authentication.\n", err)
+			os.Exit(1)
+		}
+		key = k
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           api.New(mgr, key, version, stop).Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 16,
+	}
 	go func() {
 		<-ctx.Done()
 		sh, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -262,7 +384,7 @@ func start(addr string) {
 func call(addr, method, path string, body []byte) {
 	req, _ := http.NewRequest(method, "http://"+addr+path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if k := os.Getenv("LOCALIMAGE_API_KEY"); k != "" {
+	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
 	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
@@ -288,8 +410,14 @@ func record(addr string, args []string) {
 	}
 	action, id := args[0], args[1]
 	switch action {
-	case "start", "stop":
-		call(addr, http.MethodPost, "/v1/sessions/"+id+"/recording/"+action, nil)
+	case "start":
+		fs := flag.NewFlagSet("record start", flag.ExitOnError)
+		max := fs.Int("max", 0, "stop by itself after this many seconds (default 3600)")
+		fs.Parse(args[2:])
+		body, _ := json.Marshal(map[string]any{"max_seconds": *max})
+		call(addr, http.MethodPost, "/v1/sessions/"+id+"/recording/start", body)
+	case "stop":
+		call(addr, http.MethodPost, "/v1/sessions/"+id+"/recording/stop", nil)
 	case "get":
 		fs := flag.NewFlagSet("record get", flag.ExitOnError)
 		out := fs.String("o", id+".mp4", "output file")
@@ -302,7 +430,7 @@ func record(addr string, args []string) {
 
 func download(addr, path, out string) {
 	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
-	if k := os.Getenv("LOCALIMAGE_API_KEY"); k != "" {
+	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
 	resp, err := http.DefaultClient.Do(req)
@@ -315,6 +443,10 @@ func download(addr, path, out string) {
 		b, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "%s\n", b)
 		os.Exit(1)
+	}
+	if out == "-" {
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
 	}
 	f, err := os.Create(out)
 	if err != nil {
@@ -396,7 +528,7 @@ func pull(addr string, browsers []string) {
 	body, _ := json.Marshal(map[string]any{"browsers": browsers})
 	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/images/prepare", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if k := os.Getenv("LOCALIMAGE_API_KEY"); k != "" {
+	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
 	resp, err := http.DefaultClient.Do(req)
@@ -433,4 +565,30 @@ func pull(addr string, browsers []string) {
 			return
 		}
 	}
+}
+
+// upload copies a local file into a session.
+func upload(addr, id, local, remote string) {
+	data, err := os.ReadFile(local)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	req, _ := http.NewRequest(http.MethodPut, "http://"+addr+"/v1/sessions/"+id+"/files?"+url.Values{"path": {remote}}.Encode(), bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if k := auth.Resolve(); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "daemon not reachable (run `localimage start`):", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "%s\n", out)
+		os.Exit(1)
+	}
+	fmt.Printf("uploaded %s to %s (%d bytes)\n", local, remote, len(data))
 }

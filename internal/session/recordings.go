@@ -42,7 +42,13 @@ func isoMS(ms int64) string { return time.UnixMilli(ms).UTC().Format("2006-01-02
 // written. started_at is when capture began, which is the video's time zero. The file is a
 // fragmented MP4, so it stays playable even if the container is killed. Only one recording
 // can run at a time per session.
-func (m *Manager) StartRecording(ctx context.Context, id string) (*RecordingInfo, error) {
+func (m *Manager) StartRecording(ctx context.Context, id string, maxSeconds int) (*RecordingInfo, error) {
+	if maxSeconds == 0 {
+		maxSeconds = envInt("LOCALIMAGE_MAX_RECORDING_SECONDS", 3600)
+	}
+	if maxSeconds < 1 || maxSeconds > 4*3600 {
+		return nil, invalid("max_seconds must be between 1 and %d", 4*3600)
+	}
 	cid, err := m.containerOf(ctx, id)
 	if err != nil {
 		return nil, err
@@ -57,7 +63,7 @@ done
 ms=$(date +%%s%%3N)
 nohup ffmpeg -y -loglevel error -f x11grab -framerate 15 -i :99.0 \
   -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
-  -movflags +frag_keyframe+empty_moov+default_base_moof $d/$rid.mp4 </dev/null >$d/$rid.log 2>&1 &
+  -movflags +frag_keyframe+empty_moov+default_base_moof -t %[3]d $d/$rid.mp4 </dev/null >$d/$rid.log 2>&1 &
 echo $! > $d/$rid.pid
 echo $ms > $d/$rid.start
 i=0
@@ -68,7 +74,7 @@ while [ $i -lt 40 ]; do
 done
 [ -s $d/$rid.mp4 ] || { echo "the recorder produced no output"; exit 4; }
 echo $ms
-`, recDir, rid)
+`, recDir, rid, maxSeconds)
 	out, code, err := m.run(ctx, cid, "neko", "sh", "-c", script)
 	if err != nil {
 		return nil, err
@@ -139,7 +145,7 @@ func (m *Manager) Recordings(ctx context.Context, id string) ([]RecordingInfo, e
 		if !recID.MatchString(rid) {
 			continue
 		}
-		info, err := m.recordingInfo(ctx, cid, rid, false)
+		info, err := m.recordingInfo(ctx, cid, rid, true)
 		if err != nil {
 			return nil, err
 		}
@@ -155,6 +161,7 @@ func (m *Manager) recordingInfo(ctx context.Context, cid, rid string, probe bool
 	out, code, err := m.run(ctx, cid, "neko", "sh", "-c", fmt.Sprintf(`
 d=%s; rid=%s
 run=0; [ -f $d/$rid.pid ] && kill -0 "$(cat $d/$rid.pid)" 2>/dev/null && run=1
+[ $run = 0 ] && [ ! -f $d/$rid.stop ] && [ -f $d/$rid.mp4 ] && { date -r $d/$rid.mp4 +%%s%%3N > $d/$rid.stop; cp $d/$rid.stop $d/$rid.done; }
 printf '%%s\t%%s\t%%s\t%%s\t%%s\n' "$run" "$(cat $d/$rid.start 2>/dev/null)" "$(cat $d/$rid.stop 2>/dev/null)" "$(stat -c %%s $d/$rid.mp4 2>/dev/null)" "$(cat $d/$rid.done 2>/dev/null)"
 `, recDir, rid))
 	if err != nil {

@@ -15,7 +15,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from localimage import LocalImage, LocalImageError, ensure_daemon  # noqa: E402
+from localimage import SUPPORTED_API_VERSION, LocalImage, LocalImageError, ensure_daemon  # noqa: E402
 
 ADDR = "127.0.0.1:7794"
 MAX = 2
@@ -253,6 +253,51 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, "request_timeout")
         finally:
             srv.close()
+
+    def test_attach_logs_compatibility_and_ownership(self):
+        with self.li.create(ttl_seconds=300) as s:
+            other = LocalImage(addr=ADDR).attach(s.id)  # as another process would, knowing only the id
+            self.assertEqual((other.id, other.connect_url), (s.id, s.connect_url))
+            self.assertEqual(other.exec(["echo", "hi"])["stdout"].strip(), "hi")
+            self.assertGreater(len(other.logs()), 0)
+            self.assertLessEqual(len(other.logs(source="neko", tail=3).strip().splitlines()), 3)
+            with self.assertRaises(LocalImageError) as cm:
+                other.logs(source="nonsense")
+            self.assertEqual(cm.exception.code, "invalid_request")
+        with self.assertRaises(LocalImageError) as cm:
+            self.li.attach("ffffffff")
+        self.assertEqual(cm.exception.code, "session_gone")
+
+        info = self.li.assert_compatible()
+        self.assertEqual(info["api_version"], SUPPORTED_API_VERSION)
+        with self.assertRaises(LocalImageError) as cm:
+            self.li.assert_compatible(chromium="1.0")
+        self.assertEqual(cm.exception.code, "incompatible_daemon")
+
+        # Someone else's daemon is reused, and we do not claim to have started it.
+        again = ensure_daemon(addr=ADDR, env=ENV)
+        self.assertFalse(again["started"])
+
+    def test_health_tags_options_and_saved_logs(self):
+        import tempfile
+        with self.li.create(ttl_seconds=300, tags={"stage": "running"}, timezone="Europe/Berlin") as s:
+            h = s.health()
+            self.assertEqual((h["starts"], h["restarts"]), (1, 0))
+            self.assertEqual(s.exec(["sh", "-c", "echo $TZ"])["stdout"].strip(), "Europe/Berlin")
+            self.assertEqual(s.update_tags(set={"stage": "failed"}, remove=["nothing"]), {"stage": "failed"})
+            self.assertEqual([x["id"] for x in self.li.list(tags={"stage": "failed"})], [s.id])
+            self.assertEqual(self.li.list(tags={"stage": "running"}), [])
+            with tempfile.TemporaryDirectory() as d:
+                files = s.save_logs(d)
+                self.assertTrue(any(f.endswith("chromium.log") for f in files))
+            rec = s.start_recording(max_seconds=2)
+            time.sleep(4.5)
+            self.assertFalse(s.recordings()[0]["running"], "it stopped at its limit")
+            self.assertEqual(rec["content_type"], "video/mp4")
+        with self.assertRaises(LocalImageError) as cm:
+            self.li.create(timezone="not a zone!")
+        self.assertEqual(cm.exception.code, "invalid_request")
+        self.assertIsInstance(self.li.prune(), list)
 
 
 if __name__ == "__main__":

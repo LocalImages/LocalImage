@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from ._binary import find_binary, make_executable
+from ._apikey import read_key_file
 
+SUPPORTED_API_VERSION = 1  # the daemon API revision this SDK speaks
 DEFAULT_ADDR = os.environ.get("LOCALIMAGE_ADDR", "127.0.0.1:7777")
 _DEFAULT = object()  # "use the client's default timeout"
 
@@ -27,12 +29,14 @@ class LocalImageError(RuntimeError):
     - ``conflict``: clashes with current state (for example a profile already in use)
     - ``image_not_ready``: ``no_build`` was set and the browser image is not built (see prepare())
     - ``unauthorized``: missing or wrong API key
+    - ``forbidden``: the request's Host or Origin is not allowed (LOCALIMAGE_ALLOWED_HOSTS)
     - ``docker_unavailable``: the daemon cannot reach Docker
     - ``not_found``, ``internal``
 
     Codes raised by this SDK:
 
     - ``request_timeout``: the call exceeded its ``timeout``
+    - ``incompatible_daemon``: assert_compatible() found a daemon this SDK cannot talk to
     - ``daemon_unreachable``: nothing is listening at the daemon address
     - ``daemon_start_failed``: ensure_daemon could not start the daemon (the message has its log)
     - ``binary_not_found``: there is no localimage binary
@@ -46,12 +50,18 @@ class LocalImageError(RuntimeError):
         self.details = details
 
 
-def _healthy(addr: str) -> bool:
+def _healthy(addr: str):
+    """{"pid": int | None} when a daemon answers at addr (pid is None for an old daemon), else None."""
     try:
         with urllib.request.urlopen(f"http://{addr}/healthz", timeout=1.5) as r:
-            return r.status == 200
+            if r.status != 200:
+                return None
+            try:
+                return {"pid": json.loads(r.read() or b"{}").get("pid")}
+            except ValueError:
+                return {"pid": None}
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def ensure_daemon(addr: str = DEFAULT_ADDR, api_key: Optional[str] = None, env: Optional[dict] = None,
@@ -94,10 +104,15 @@ def ensure_daemon(addr: str = DEFAULT_ADDR, api_key: Optional[str] = None, env: 
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if _healthy(addr):
-            # The daemon is detached on purpose: stop Popen from warning when it is collected.
-            proc.returncode = 0
-            return {"started": True, "addr": addr, "pid": proc.pid, "log_file": log}
+        h = _healthy(addr)
+        if h:
+            # Several processes may start a daemon at once; only one binds the port and the others
+            # exit. `started` is true only for the process whose daemon is the one answering.
+            if h["pid"] is None or h["pid"] == proc.pid:
+                # The daemon is detached on purpose: stop Popen from warning when it is collected.
+                proc.returncode = 0
+                return {"started": True, "addr": addr, "pid": proc.pid, "log_file": log}
+            return {"started": False, "addr": addr}
         if proc.poll() is not None:
             # Our process exited. If another process started a daemon at the same moment, that
             # one answers; otherwise this really failed.
@@ -173,9 +188,11 @@ class Session:
     def drag(self, path: list, button: str = "left") -> None:
         self._computer("drag", {"path": path, "button": button})
 
-    def start_recording(self) -> dict:
-        """Begin a recording; returns {"replay_id", "status"}. One can run at a time."""
-        return self._client._call("POST", f"/v1/sessions/{self.id}/recording/start")
+    def start_recording(self, max_seconds: Optional[int] = None) -> dict:
+        """Begin a recording (video/mp4); returns its info, with "replay_id" and "started_at". One can
+        run at a time. It stops by itself after max_seconds (default 3600)."""
+        body = {"max_seconds": max_seconds} if max_seconds else None
+        return self._client._call("POST", f"/v1/sessions/{self.id}/recording/start", body)
 
     def stop_recording(self, replay_id: Optional[str] = None) -> dict:
         body = {"replay_id": replay_id} if replay_id else None
@@ -206,6 +223,40 @@ class Session:
         q = urllib.parse.urlencode({"path": path})
         return self._client._call("GET", f"/v1/sessions/{self.id}/files/list?{q}")
 
+    def logs(self, source: Optional[str] = None, tail: Optional[int] = None) -> str:
+        """The end of one of the session's logs: source is "container" (default), "chromium",
+        "firefox", "neko", "xorg", "openbox", "pulseaudio" or "cdp-forward"; tail is a number of lines
+        (default 200). Works for a stopped session too, to see why it died."""
+        q = urllib.parse.urlencode({k: v for k, v in (("source", source), ("tail", tail)) if v})
+        return self._client._raw("GET", f"/v1/sessions/{self.id}/logs" + (f"?{q}" if q else "")).decode("utf-8", "replace")
+
+    def health(self) -> dict:
+        """Whether the browser is up and whether it has restarted: state, health, starts, restarts,
+        last_started_at. After a crash the browser comes back by itself on the same URL, but as a
+        new, empty browser: "restarts" going up is how a client finds out."""
+        return self._client._call("GET", f"/v1/sessions/{self.id}/health")
+
+    def update_tags(self, set: Optional[dict] = None, remove: Optional[list] = None) -> dict:
+        """Change tags after creation. Returns the resulting tags and updates ``tags`` on this object."""
+        r = self._client._call("PATCH", f"/v1/sessions/{self.id}/tags", {"set": set or {}, "remove": remove or []})
+        self.tags = r["tags"]
+        return r["tags"]
+
+    def save_logs(self, directory: str) -> list:
+        """Write every log source to <directory>/<id>/<source>.log and return the paths. A session's
+        logs die with its container, so call this when a test fails, before close()."""
+        target = os.path.join(directory, self.id)
+        os.makedirs(target, exist_ok=True)
+        written = []
+        for source in ("container", "chromium", "firefox", "neko", "xorg", "openbox", "pulseaudio", "cdp-forward"):
+            text = self.logs(source=source, tail=5000)
+            if text.strip():
+                path = os.path.join(target, f"{source}.log")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                written.append(path)
+        return written
+
     def close(self) -> bool:
         """Delete the session. Safe to call more than once; True if this call removed it."""
         return self._client.delete(self.id)
@@ -232,10 +283,15 @@ class LocalImage:
         # long request. Pass timeout= to any of them to override.
         self.timeout = timeout
         self.addr = addr
-        self.api_key = api_key or os.environ.get("LOCALIMAGE_API_KEY")
+        self.api_key = api_key
         self.auto_start = (os.environ.get("LOCALIMAGE_AUTOSTART") == "1") if auto_start is None else auto_start
         self.daemon_env = daemon_env or {}
         self._start_lock = threading.Lock()
+
+    def _key(self) -> Optional[str]:
+        """The key sent to the daemon: the api_key argument, else LOCALIMAGE_API_KEY, else the key
+        file the daemon creates (read when a call is made, so a daemon started by auto_start works)."""
+        return self.api_key or os.environ.get("LOCALIMAGE_API_KEY") or read_key_file()
 
     def ensure_daemon(self, **kwargs) -> dict:
         """Start the daemon if it is not running (see the module-level ensure_daemon)."""
@@ -251,7 +307,7 @@ class LocalImage:
             f"http://{self.addr}{path}", data=data, method=method,
             headers={"Content-Type": "application/octet-stream" if body is None and data is not None
                      else "application/json",
-                     **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})},
+                     **({"Authorization": f"Bearer {self._key()}"} if self._key() else {})},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -309,7 +365,7 @@ class LocalImage:
         req = urllib.request.Request(
             f"http://{self.addr}/v1/images/prepare", data=body, method="POST",
             headers={"Content-Type": "application/json",
-                     **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})})
+                     **({"Authorization": f"Bearer {self._key()}"} if self._key() else {})})
         last = None
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -360,6 +416,27 @@ class LocalImage:
         {"version", "max_sessions", "max_ttl_seconds", "running", "available"}."""
         return self._call("GET", "/v1/info")
 
+    def assert_compatible(self, chromium=None, firefox=None) -> dict:
+        """Raise ``incompatible_daemon`` unless the daemon speaks this SDK's API and, if given, its
+        browser versions match (a string for an exact version, or a compiled regex). Returns info()."""
+        info = self.info()
+        bad = []
+        if info.get("api_version") != SUPPORTED_API_VERSION:
+            bad.append(f"its API version is {info.get('api_version') or 'unknown (an old daemon)'}, "
+                       f"this SDK needs {SUPPORTED_API_VERSION}")
+        for name, want in (("chromium", chromium), ("firefox", firefox)):
+            if want is None:
+                continue
+            have = (info.get("components") or {}).get(name, {}).get("version", "")
+            ok = want.search(have) if hasattr(want, "search") else have == str(want)
+            if not ok:
+                bad.append(f"{name} is {have or 'unknown'}, expected {getattr(want, 'pattern', want)}")
+        if bad:
+            raise LocalImageError(f"the daemon at {self.addr} (version {info.get('version')}) is not "
+                                  f"compatible: {'; '.join(bad)}", code="incompatible_daemon",
+                                  details={"apiVersion": info.get("api_version")})
+        return info
+
     def assert_capacity(self, n: int) -> dict:
         """Fail early, with a clear error, when ``n`` sessions could never run at once.
 
@@ -382,13 +459,16 @@ class LocalImage:
                memory_mb: Optional[int] = None, cpus: Optional[float] = None,
                kiosk: bool = False, extensions: Optional[list] = None,
                tags: Optional[Dict[str, str]] = None, wait_seconds: Optional[int] = None,
-               no_build: bool = False, timeout: Optional[float] = None) -> Session:
+               no_build: bool = False, timeout: Optional[float] = None,
+               webgl: bool = False, timezone: Optional[str] = None, locale: Optional[str] = None) -> Session:
         """Start a browser session.
 
         ``tags`` is {key: value} metadata stored on the session, returned by ``list()`` and usable
         as a list filter (up to 20 tags; keys are letters, digits, '.', '_' and '-').
         ``wait_seconds`` queues for a free session slot instead of failing at once with
-        ``limit_exceeded``. ``no_build=True`` fails with ``image_not_ready`` instead of building a
+        ``limit_exceeded``. ``webgl=True`` enables WebGL (software rendering, Chromium only);
+        ``timezone`` (an IANA name such as ``Europe/Berlin``) and ``locale`` (such as ``de-DE``,
+        Chromium only) set the browser's timezone and language. ``no_build=True`` fails with ``image_not_ready`` instead of building a
         missing browser image (see ``prepare()``). ``timeout`` limits how long the call may stay
         silent (default: no limit, because a first-run image build is one long request).
         """
@@ -396,10 +476,20 @@ class LocalImage:
             "browser": browser, "screen": screen or "", "ttl_seconds": ttl_seconds or 0,
             "profile": profile or "", "memory_mb": memory_mb or 0, "cpus": cpus or 0,
             "kiosk": kiosk, "extensions": extensions or [], "tags": tags or {},
-            "wait_seconds": wait_seconds or 0, "no_build": no_build}, timeout=timeout)
+            "wait_seconds": wait_seconds or 0, "no_build": no_build,
+            "webgl": webgl, "timezone": timezone or "", "locale": locale or ""}, timeout=timeout)
+        return self._session(s)
+
+    def _session(self, s: dict) -> Session:
         return Session(s["id"], s["browser"], s["protocol"], s["connect_url"], s["live_url"],
                        s["view_url"], s.get("profile"), s.get("extensions") or [], s.get("tags") or {},
                        s.get("downloads_dir", "/home/neko/Downloads"), s["expires_at"], self)
+
+    def attach(self, session_id: str) -> Session:
+        """A Session for one that already exists, by id: from another process, after a restart, or
+        from a stored lease. Raises ``session_gone`` if it is not there. A stopped session can be
+        attached too, to read its logs."""
+        return self._session(self._call("GET", f"/v1/sessions/{session_id}"))
 
     def list(self, tags: Optional[Dict[str, str]] = None) -> list:
         """List sessions in every state (a crashed worker can leave stopped containers), as the
@@ -419,6 +509,11 @@ class LocalImage:
             if e.code == "session_gone":
                 return False
             raise
+
+    def prune(self) -> list:
+        """Remove browser images left behind by older versions. Returns the tags removed
+        (info()["stale_images"] says how many there are)."""
+        return self._call("POST", "/v1/images/prune")["removed"]
 
     def upload_extension(self, name: str, zip_bytes: bytes) -> dict:
         """Upload an unpacked Chromium extension as a zip (manifest.json at the root or in one folder)."""

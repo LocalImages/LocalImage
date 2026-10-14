@@ -41,7 +41,7 @@ func (p *Proxy) lookup(r *http.Request, token string, view bool) (*session.Recor
 	p.mu.Lock()
 	e, ok := p.cache[key]
 	p.mu.Unlock()
-	if ok && time.Since(e.fetched) < 5*time.Second {
+	if ok && time.Since(e.fetched) < cacheTTL {
 		return e.rec, nil
 	}
 	lookup := p.mgr.ByToken
@@ -53,6 +53,7 @@ func (p *Proxy) lookup(r *http.Request, token string, view bool) (*session.Recor
 		return nil, err
 	}
 	p.mu.Lock()
+	p.evictStale(time.Now())
 	p.cache[key] = cacheEntry{rec: rec, fetched: time.Now()}
 	p.mu.Unlock()
 	return rec, nil
@@ -137,5 +138,19 @@ func rewriteWS(clientHost, backendPort, prefix string) func(*http.Response) erro
 		resp.ContentLength = int64(len(body))
 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		return nil
+	}
+}
+
+// cacheTTL is how long a session lookup is reused before Docker is asked again.
+const cacheTTL = 5 * time.Second
+
+// evictStale drops lookups older than cacheTTL, so the cache holds only recently used sessions
+// and a daemon that runs for weeks does not accumulate every session it ever served. The caller
+// holds p.mu.
+func (p *Proxy) evictStale(now time.Time) {
+	for k, e := range p.cache {
+		if now.Sub(e.fetched) >= cacheTTL {
+			delete(p.cache, k)
+		}
 	}
 }

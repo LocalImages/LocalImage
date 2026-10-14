@@ -181,6 +181,7 @@ t('invalid computer-control input is rejected', async () => {
     const r = (action, body) =>
       fetch(`http://${li.addr}/v1/sessions/${s.id}/computer/${action}`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${li.apiKey}` },
         body: JSON.stringify(body),
       });
     assert.equal((await r('click', { x: -5, y: 0 })).status, 400);

@@ -3,8 +3,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import * as pw from 'playwright-core';
-import { LocalImage, LocalImageError } from '../src/index.js';
+import { LocalImage, LocalImageError, SUPPORTED_API_VERSION } from '../src/index.js';
 
 const li = new LocalImage();
 const daemonUp = await li.list().then(() => true, () => false);
@@ -236,11 +239,12 @@ t('the SDK objects have exactly the declared members (src/index.d.ts and test/ty
     'id', 'browser', 'protocol', 'connectUrl', 'liveUrl', 'viewUrl', 'profile', 'extensions', 'tags',
     'downloadsDir', 'expiresAt', 'connect', 'screenshot', 'click', 'moveMouse', 'type', 'pressKey', 'scroll',
     'drag', 'startRecording', 'stopRecording', 'recordings', 'downloadRecording', 'exec', 'uploadFile',
-    'downloadFile', 'listFiles', 'close',
+    'downloadFile', 'listFiles', 'close', 'logs', 'health', 'updateTags', 'saveLogs',
   ];
   const CLIENT_KEYS = [
     'addr', 'apiKey', 'autoStart', 'daemonEnv', 'ensureDaemon', 'shutdown', 'info', 'assertCapacity', 'prepare',
     'create', 'list', 'delete', 'uploadExtension', 'extensions', 'deleteExtension', 'profiles', 'deleteProfile',
+    'attach', 'assertCompatible', 'prune',
   ];
   const publicKeys = (o) =>
     [...new Set([...Object.keys(o), ...Object.getOwnPropertyNames(Object.getPrototypeOf(o))])]
@@ -249,6 +253,131 @@ t('the SDK objects have exactly the declared members (src/index.d.ts and test/ty
   const s = await li.create({ ttlSeconds: 120 });
   try {
     assert.deepEqual(Object.keys(s).sort(), [...SESSION_KEYS].sort(), 'Session');
+  } finally {
+    await s.close();
+  }
+});
+
+const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
+
+t('attach: another process acts on a session knowing only its id; a stopped one can still be inspected', async () => {
+  const s = await li.create({ ttlSeconds: 300 });
+  try {
+    // Process B attaches by id and uploads a file, records, and reads logs.
+    const r = spawnSync('node', [FIXTURES + 'attach-act.mjs', s.id], { encoding: 'utf8', timeout: 120_000, env: process.env });
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.deepEqual([out.id, out.stopped], [s.id, 'stopped']);
+    assert.equal((await s.downloadFile(`${s.downloadsDir}/from-other-process.txt`)).toString(), 'written by another process');
+    assert.deepEqual((await s.recordings()).map((x) => x.replay_id), [out.replay_id], 'the recording is visible to the creator');
+
+    // The attached object works like the one create() returned.
+    const again = await new LocalImage().attach(s.id);
+    assert.deepEqual([again.id, again.connectUrl, again.liveUrl, again.downloadsDir], [s.id, s.connectUrl, s.liveUrl, s.downloadsDir]);
+    assert.equal((await again.exec(['echo', 'attached'])).stdout.trim(), 'attached');
+
+    // A session that has stopped can still be attached, so its logs can say why it died.
+    execFileSync('docker', ['stop', '-t', '1', `localimage-${s.id}`], { stdio: 'ignore' });
+    const dead = await li.attach(s.id);
+    assert.ok((await dead.logs({ source: 'chromium', tail: 20 })).length > 0, 'logs of a stopped session');
+  } finally {
+    await s.close();
+  }
+  const e = await errorOf(li.attach('ffffffff'));
+  assert.equal(e?.code, 'session_gone');
+});
+
+t('logs: container and browser logs, a tail limit, and a clear error for an unknown source', async () => {
+  const s = await li.create({ ttlSeconds: 300 });
+  try {
+    assert.ok((await s.logs()).length > 0, 'container output');
+    const chromium = await s.logs({ source: 'chromium' });
+    assert.ok(chromium.length > 0, 'the browser log');
+    assert.ok((await s.logs({ source: 'neko', tail: 3 })).trim().split('\n').length <= 3, 'tail limits the lines');
+    const e = await errorOf(s.logs({ source: 'nonsense' }));
+    assert.equal(e?.code, 'invalid_request');
+    assert.match(e.message, /chromium/, 'the error lists the valid sources');
+    assert.equal((await errorOf(s.logs({ tail: 999999 })))?.code, 'invalid_request');
+  } finally {
+    await s.close();
+  }
+});
+
+t('versions: info() reports the browser versions in the images, and assertCompatible checks them', async () => {
+  const info = await li.info();
+  assert.equal(info.apiVersion, SUPPORTED_API_VERSION);
+  assert.ok(info.components.chromium?.version && info.components.firefox?.version, 'both browsers are described');
+  assert.equal(info.components.firefox.playwright, '1.63.0');
+
+  const s = await li.create({ ttlSeconds: 300 });
+  try {
+    const real = (await s.exec(['chromium', '--version'])).stdout;
+    assert.ok(real.includes(info.components.chromium.version), `info says ${info.components.chromium.version}, the browser says ${real.trim()}`);
+  } finally {
+    await s.close();
+  }
+  const f = await li.create({ browser: 'firefox', ttlSeconds: 300 });
+  try {
+    const b = await f.connect(pw);
+    assert.ok(b.version().startsWith(info.components.firefox.version), `firefox ${b.version()} vs ${info.components.firefox.version}`);
+    await b.close();
+  } finally {
+    await f.close();
+  }
+
+  assert.equal((await li.assertCompatible({ chromium: new RegExp(`^${info.components.chromium.version.split('.')[0]}\\.`) })).apiVersion, SUPPORTED_API_VERSION);
+  const bad = await errorOf(li.assertCompatible({ chromium: /^1\./ }));
+  assert.equal(bad?.code, 'incompatible_daemon');
+  assert.match(bad.message, /chromium is 15/);
+});
+
+t('host access: host.docker.internal resolves, and reaches host services on a non-loopback address', async () => {
+  const open = http.createServer((q, r) => r.end('hello from the host')); // listens on every interface
+  const loopback = http.createServer((q, r) => r.end('loopback only')); // listens on 127.0.0.1 only
+  await new Promise((r) => open.listen(0, '0.0.0.0', r));
+  await new Promise((r) => loopback.listen(0, '127.0.0.1', r));
+  const s = await li.create({ ttlSeconds: 300 });
+  try {
+    const sh = async (cmd) => (await s.exec(['sh', '-c', cmd])).stdout.trim();
+    assert.match(await sh('getent hosts host.docker.internal'), /^\d+\.\d+\.\d+\.\d+/, 'the name resolves');
+    assert.equal(await sh(`wget -q -O- -T 3 http://host.docker.internal:${open.address().port}/ 2>&1`), 'hello from the host');
+    // The limit, stated plainly: a service bound only to the host's loopback is not reachable from a container.
+    assert.equal(await sh(`wget -q -O- -T 3 http://host.docker.internal:${loopback.address().port}/ 2>&1 | head -c 20`), '', 'loopback-only services are unreachable');
+  } finally {
+    await s.close();
+    open.close();
+    loopback.close();
+  }
+});
+
+t('src/types.d.ts matches what the daemon really returns, in both directions', async () => {
+  const dts = readFileSync(fileURLToPath(new URL('../src/types.d.ts', import.meta.url)), 'utf8');
+  const declared = (name) => {
+    const body = dts.match(new RegExp(`export interface ${name}(?: extends \\w+)? \\{([\\s\\S]*?)\\n\\}`))[1];
+    const req = new Set(), opt = new Set();
+    for (const line of body.split('\n')) {
+      const p = line.match(/^  (\w+)(\?)?:/);
+      if (p) (p[2] ? opt : req).add(p[1]);
+    }
+    return { req, opt };
+  };
+  const check = (name, obj) => {
+    const { req, opt } = declared(name);
+    const real = Object.keys(obj);
+    assert.deepEqual(real.filter((k) => !req.has(k) && !opt.has(k)), [], `${name}: returned but not declared`);
+    assert.deepEqual([...req].filter((k) => !real.includes(k)), [], `${name}: declared required but not returned`);
+  };
+  const s = await li.create({ ttlSeconds: 300, tags: { drift: 'check' } });
+  try {
+    check('SessionInfo', (await li.list({ tags: { drift: 'check' } }))[0]);
+    check('Info', await li.info());
+    check('BrowserHealth', await s.health());
+    check('RecordingInfo', await s.startRecording({ maxSeconds: 5 }));
+    await sleep(1500);
+    check('RecordingInfo', await s.stopRecording());
+    check('ExecResult', await s.exec(['true']));
+    await s.uploadFile('/tmp/drift.txt', 'x');
+    check('FileInfo', (await s.listFiles('/tmp')).find((f) => f.name === 'drift.txt'));
   } finally {
     await s.close();
   }

@@ -7,8 +7,10 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,7 +40,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+	return logged(func(w http.ResponseWriter, r *http.Request) {
 		if s.apiKey != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.apiKey)) != 1 {
@@ -47,7 +49,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 		next(w, r)
-	}
+	})
 }
 
 type apiError string
@@ -75,18 +77,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/files", s.auth(s.fileDownload))
 	mux.HandleFunc("GET /v1/sessions/{id}/files/list", s.auth(s.fileList))
 	mux.HandleFunc("GET /v1/sessions/{id}/screenshot", s.auth(s.screenshot))
+	mux.HandleFunc("GET /v1/sessions/{id}/logs", s.auth(s.logs))
+	mux.HandleFunc("GET /v1/sessions/{id}/health", s.auth(s.health))
+	mux.HandleFunc("PATCH /v1/sessions/{id}/tags", s.auth(s.updateTags))
+	mux.HandleFunc("POST /v1/images/prune", s.auth(s.prune))
 	mux.HandleFunc("POST /v1/sessions/{id}/computer/{action}", s.auth(s.computer))
 	mux.HandleFunc("POST /v1/extensions", s.auth(s.extUpload))
 	mux.HandleFunc("GET /v1/extensions", s.auth(s.extList))
 	mux.HandleFunc("DELETE /v1/extensions/{name}", s.auth(s.extDelete))
 	mux.HandleFunc("GET /v1/profiles", s.auth(s.profiles))
 	mux.HandleFunc("DELETE /v1/profiles/{name}", s.auth(s.deleteProfile))
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) })
+	// pid lets a caller that just started a daemon tell whether it is the one that answered.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, 200, map[string]any{"ok": true, "pid": os.Getpid()})
+	})
 	// The session token in the path is the credential for everything under /t/.
 	px := proxy.New(s.mgr)
 	mux.Handle("/t/{token}/", px)
 	mux.Handle("/v/{token}/", px)
-	return mux
+	return newGuard().wrap(mux)
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -105,12 +114,15 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		WaitSeconds int `json:"wait_seconds"`
 		// NoBuild fails with image_not_ready instead of building a missing browser image.
 		NoBuild bool `json:"no_build"`
+		// WebGL turns on WebGL (software rendering, Chromium only); Timezone and Locale set the
+		// browser's timezone (IANA name) and language.
+		WebGL    bool   `json:"webgl"`
+		Timezone string `json:"timezone"`
+		Locale   string `json:"locale"`
 	}
-	if r.ContentLength != 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			fail(w, http.StatusBadRequest, err)
-			return
-		}
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
+		return
 	}
 	if req.WaitSeconds < 0 || req.WaitSeconds > 600 {
 		fail(w, http.StatusBadRequest, apiError("wait_seconds must be between 0 and 600"))
@@ -128,6 +140,9 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		Tags:       req.Tags,
 		Wait:       time.Duration(req.WaitSeconds) * time.Second,
 		NoBuild:    req.NoBuild,
+		WebGL:      req.WebGL,
+		Timezone:   req.Timezone,
+		Locale:     req.Locale,
 	})
 	if err != nil {
 		fail(w, http.StatusInternalServerError, err)
@@ -150,11 +165,9 @@ func (s *Server) prepare(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Browsers []string `json:"browsers"`
 	}
-	if r.ContentLength != 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			fail(w, http.StatusBadRequest, err)
-			return
-		}
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
+		return
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -214,6 +227,67 @@ func (s *Server) shutdown(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(100 * time.Millisecond) // let the response go out first
 		s.onShutdown()
 	}()
+}
+
+// logs returns the end of one of a session's logs as text: ?source=container|chromium|firefox|
+// neko|xorg|openbox|... (default container) and ?tail=N lines (default 200). It also works for a
+// stopped session, to see why it died.
+func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
+	tail := 0
+	if v := r.URL.Query().Get("tail"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			fail(w, http.StatusBadRequest, apiError("tail must be a number"))
+			return
+		}
+		tail = n
+	}
+	text, err := s.mgr.Logs(r.Context(), r.PathValue("id"), r.URL.Query().Get("source"), tail)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(text))
+}
+
+// health reports on a session's browser: container state, Docker health, and how many times the
+// browser has started (restarts > 0 means it crashed and came back as a new, empty browser).
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	h, err := s.mgr.Health(r.Context(), r.PathValue("id"))
+	if err != nil {
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, h)
+}
+
+// updateTags changes a session's tags after creation: {"set": {...}, "remove": [...]}.
+func (s *Server) updateTags(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Set    map[string]string `json:"set"`
+		Remove []string          `json:"remove"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
+		return
+	}
+	tags, err := s.mgr.UpdateTags(r.Context(), r.PathValue("id"), req.Set, req.Remove)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tags": tags})
+}
+
+// prune removes browser images left behind by older versions of localimage.
+func (s *Server) prune(w http.ResponseWriter, r *http.Request) {
+	removed, err := s.mgr.Prune(r.Context())
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"removed": removed})
 }
 
 // parseTagFilters turns repeated ?tag=key=value parameters into a filter map.
@@ -282,7 +356,14 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) recStart(w http.ResponseWriter, r *http.Request) {
-	info, err := s.mgr.StartRecording(r.Context(), r.PathValue("id"))
+	var req struct {
+		MaxSeconds int `json:"max_seconds"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
+		return
+	}
+	info, err := s.mgr.StartRecording(r.Context(), r.PathValue("id"), req.MaxSeconds)
 	if err != nil {
 		fail(w, http.StatusConflict, err)
 		return
@@ -294,8 +375,9 @@ func (s *Server) recStop(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ReplayID string `json:"replay_id"`
 	}
-	if r.ContentLength != 0 {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
+		return
 	}
 	info, err := s.mgr.StopRecording(r.Context(), r.PathValue("id"), req.ReplayID)
 	if err != nil {
@@ -333,8 +415,8 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 		Cwd            string   `json:"cwd"`
 		TimeoutSeconds int      `json:"timeout_seconds"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		fail(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
 		return
 	}
 	res, err := s.mgr.Exec(r.Context(), r.PathValue("id"), req.Command, req.Cwd, req.TimeoutSeconds)
@@ -346,7 +428,7 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fileUpload(w http.ResponseWriter, r *http.Request) {
-	n, err := s.mgr.UploadFile(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"), r.Body)
+	n, err := s.mgr.UploadFile(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"), http.MaxBytesReader(w, r.Body, 101<<20))
 	if err != nil {
 		fail(w, http.StatusBadRequest, err)
 		return
@@ -375,7 +457,7 @@ func (s *Server) fileList(w http.ResponseWriter, r *http.Request) {
 
 // extUpload takes a zip of an unpacked extension as the request body.
 func (s *Server) extUpload(w http.ResponseWriter, r *http.Request) {
-	data, err := io.ReadAll(io.LimitReader(r.Body, 51<<20))
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 51<<20))
 	if err != nil {
 		fail(w, http.StatusBadRequest, err)
 		return
@@ -450,8 +532,8 @@ func (s *Server) computer(w http.ResponseWriter, r *http.Request) {
 		DeltaY  int      `json:"delta_y"`
 		Path    [][2]int `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		fail(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		fail(w, bodyStatus(err), err)
 		return
 	}
 	id, pt := r.PathValue("id"), session.Point{X: req.X, Y: req.Y}
@@ -496,4 +578,12 @@ func RunReaper(ctx context.Context, mgr *session.Manager) {
 			mgr.Reap(ctx)
 		}
 	}
+}
+
+// bodyStatus is 413 for an oversized body and 400 for a malformed one.
+func bodyStatus(err error) int {
+	if errors.Is(err, errTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
 }
