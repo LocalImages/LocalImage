@@ -41,10 +41,11 @@ t('info, doctor and prune', () => {
   const doctor = cli('doctor');
   assert.equal(doctor.code, 0, doctor.err);
   assert.match(doctor.out, /Docker/);
+  const before = json(cli('info')).images; // a fresh machine (CI) may have no images built yet
   const first = json(cli('prune')).removed;
   assert.ok(Array.isArray(first));
   assert.deepEqual(json(cli('prune')).removed, [], 'pruning is idempotent: a second run finds nothing');
-  assert.equal(json(cli('info')).images.chromium, true, 'and the current image is untouched');
+  assert.deepEqual(json(cli('info')).images, before, 'and the current images are untouched');
 });
 
 t('a session through its whole life, from the command line', async () => {
