@@ -230,6 +230,8 @@ Environment
   LOCALIMAGE_ADDR              daemon address (default 127.0.0.1:7777)
   LOCALIMAGE_API_KEY           the control API key (default: generated into a private file the CLI and
                                SDKs read; LOCALIMAGE_NO_AUTH=1 turns authentication off)
+  LOCALIMAGE_TLS_CERT          TLS certificate PEM file
+  LOCALIMAGE_TLS_KEY           TLS private key PEM file (required with LOCALIMAGE_TLS_CERT)
   LOCALIMAGE_ALLOWED_HOSTS     extra Host names the daemon answers to (comma separated)
   LOCALIMAGE_ALLOWED_ORIGINS   extra browser origins allowed to call the API
   LOCALIMAGE_LOG_LEVEL         debug, info (default), warn or error
@@ -296,9 +298,22 @@ func doctor(addr string) {
 	maxS, maxTTL := mgr.Limits()
 	pass("limits: %d sessions, ttl up to %s", maxS, maxTTL)
 
-	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get("http://" + addr + "/healthz")
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(daemonURL(addr) + "/healthz")
 	if err != nil {
 		warn("daemon is not running at %s (start it with `localimage start`)", addr)
+		// Session lifetimes are enforced by the running daemon, so sessions can outlive theirs
+		// while it is stopped.
+		if list, lerr := mgr.List(context.Background(), nil); lerr == nil {
+			expired := 0
+			for _, r := range list {
+				if !r.ExpiresAt.IsZero() && time.Now().After(r.ExpiresAt) {
+					expired++
+				}
+			}
+			if expired > 0 {
+				warn("%d session(s) are past their lifetime and still running; they are removed once a daemon is started", expired)
+			}
+		}
 	} else {
 		resp.Body.Close()
 		pass("daemon is running at %s", addr)
@@ -336,8 +351,15 @@ func start(addr string) {
 		_, err = mgr.Ping(pctx)
 		cancel()
 	}
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "localimage: cannot reach Docker: %v\nIs Docker installed and running? Run `localimage doctor` for details.\n", err)
+		os.Exit(1)
+	}
+
+	cert, keyFile := os.Getenv("LOCALIMAGE_TLS_CERT"), os.Getenv("LOCALIMAGE_TLS_KEY")
+	if (cert == "") != (keyFile == "") {
+		fmt.Fprintln(os.Stderr, "localimage: LOCALIMAGE_TLS_CERT and LOCALIMAGE_TLS_KEY must be set together")
 		os.Exit(1)
 	}
 	if !strings.HasPrefix(addr, "127.0.0.1") && !strings.HasPrefix(addr, "localhost") && os.Getenv("LOCALIMAGE_API_KEY") == "" {
@@ -374,15 +396,28 @@ func start(addr string) {
 		defer cancel()
 		srv.Shutdown(sh)
 	}()
-	fmt.Println("localimage daemon listening on http://" + addr)
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+	scheme := "http"
+	serve := srv.ListenAndServe
+	if cert != "" {
+		scheme = "https"
+		serve = func() error { return srv.ListenAndServeTLS(cert, keyFile) }
+	}
+	fmt.Println("localimage daemon listening on " + scheme + "://" + addr)
+	if err := serve(); err != http.ErrServerClosed {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
+func daemonURL(addr string) string {
+	if os.Getenv("LOCALIMAGE_TLS_CERT") != "" {
+		return "https://" + addr
+	}
+	return "http://" + addr
+}
+
 func call(addr, method, path string, body []byte) {
-	req, _ := http.NewRequest(method, "http://"+addr+path, bytes.NewReader(body))
+	req, _ := http.NewRequest(method, daemonURL(addr)+path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
@@ -429,7 +464,7 @@ func record(addr string, args []string) {
 }
 
 func download(addr, path, out string) {
-	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+	req, _ := http.NewRequest(http.MethodGet, daemonURL(addr)+path, nil)
 	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
@@ -526,7 +561,7 @@ func zipSource(p string) ([]byte, error) {
 // pull builds the browser images ahead of time, printing progress as it goes.
 func pull(addr string, browsers []string) {
 	body, _ := json.Marshal(map[string]any{"browsers": browsers})
-	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/images/prepare", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, daemonURL(addr)+"/v1/images/prepare", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
@@ -574,7 +609,7 @@ func upload(addr, id, local, remote string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	req, _ := http.NewRequest(http.MethodPut, "http://"+addr+"/v1/sessions/"+id+"/files?"+url.Values{"path": {remote}}.Encode(), bytes.NewReader(data))
+	req, _ := http.NewRequest(http.MethodPut, daemonURL(addr)+"/v1/sessions/"+id+"/files?"+url.Values{"path": {remote}}.Encode(), bytes.NewReader(data))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if k := auth.Resolve(); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)

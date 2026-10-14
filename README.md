@@ -126,6 +126,11 @@ Chromium uses plain CDP and works with any Playwright version.
 Sessions are Docker containers named `localimage-<id>`. They are removed on `close()`, on `rm`, or
 when their TTL expires while the daemon runs.
 
+TTL cleanup is performed by the daemon's background reaper, which checks for expired sessions every
+15 seconds. There is no independent watchdog process. If the daemon is stopped, crashes, or cannot
+reach Docker, existing containers are not removed at their TTL; they remain until the daemon is
+running and can reach Docker again. Starting the daemon triggers the normal cleanup path.
+
 ## Using it from a test runner
 
 Everything a test runner or CI provider needs to manage many sessions safely.
@@ -153,6 +158,63 @@ only the process that really started it gets `started: true`. A daemon started t
 detached, so it outlives the process and is shared by parallel workers. `env` only affects a daemon
 that is started here. Stop it with `localimage stop` (or `li.shutdown()`); sessions keep running
 until their TTL passes. If it cannot start you get a clear error (see codes below), not a hang.
+
+### GitHub Actions
+
+For a Linux runner with Docker available, a job can prepare the image once, run tests, collect
+diagnostics, and clean up even when a test fails:
+
+```yaml
+name: browser tests
+on: [push, pull_request]
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g localimage
+      - run: npm ci
+      - name: Prepare image and start daemon
+        env:
+          LOCALIMAGE_API_KEY: ${{ secrets.LOCALIMAGE_API_KEY }}
+          LOCALIMAGE_MAX_SESSIONS: 4
+        run: |
+          set -euo pipefail
+          localimage doctor
+          localimage pull chromium
+          localimage start
+      - name: Run tests
+        env:
+          LOCALIMAGE_API_KEY: ${{ secrets.LOCALIMAGE_API_KEY }}
+        run: npm test
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          mkdir -p artifacts/localimage
+          localimage info > artifacts/localimage/info.txt || true
+          localimage ls > artifacts/localimage/sessions.txt || true
+          localimage doctor > artifacts/localimage/doctor.txt 2>&1 || true
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: localimage-artifacts
+          path: artifacts/localimage
+      - name: Stop daemon and remove sessions
+        if: always()
+        run: |
+          localimage stop || true
+          docker ps -aq --filter name=localimage- | xargs -r docker rm -f || true
+```
+
+Prefer a short TTL and explicit `close()`/`rm` calls in tests. Do not print the API key or session
+URLs in workflow logs. Use a repository secret only when the daemon is intentionally exposed beyond
+the runner; a generated local key is sufficient for a single-user runner.
 
 ### TypeScript
 
@@ -333,6 +395,7 @@ const { version, apiVersion, components } = await li.info();   // components.chr
 
 | localimage | daemon API | Chromium | Firefox | Playwright (Firefox only) |
 |---|---|---|---|---|
+| 0.4.x | 1 | 154.0.8037.57 | 155.0 | 1.63.0 |
 | 0.3.x | 1 | 154.0.8037.57 | 155.0 | 1.63.0 |
 
 The SDK and the daemon speak API revision `SUPPORTED_API_VERSION`; `assertCompatible` rejects a daemon
@@ -385,6 +448,14 @@ limit of 10 sessions needs roughly 3 GB. Ten sessions start in parallel in about
 To reproduce the same `apt` packages when building images, set `LOCALIMAGE_APT_SNAPSHOT` (a Debian
 snapshot timestamp such as `20261001T000000Z`) for the daemon. It is off by default because
 snapshot.debian.org can be slow.
+
+Closing or expiring a session removes its container, including recordings, downloads, browser cache,
+and other files stored in that container. Named persistent profiles are Docker volumes and survive
+session deletion; remove them explicitly with `localimage profile rm <name>` after checking usage with
+`localimage profile ls`. Docker storage exhaustion causes image builds, uploads, recordings, or session
+creation to fail; localimage does not enforce a per-session disk quota or automatically reclaim files
+from a running session. `localimage prune` only targets stale localimage image tags, keeps current
+images, and leaves an image in use by an active container.
 
 ### The daemon's log
 
@@ -484,6 +555,7 @@ The daemon exposes a JSON API (default `http://127.0.0.1:7777`):
 | `GET /v1/sessions/{id}/health` | container state, Docker health, browser starts and restarts |
 | `PATCH /v1/sessions/{id}/tags` | `{set, remove}`: change tags after creation |
 | `POST /v1/images/prune` | remove browser image tags left by older versions |
+| `POST /v1/auth/rotate-key` | rotate the generated API key; returns `{"api_key":"..."}` once, and the previous key stops working immediately |
 | `GET /v1/sessions/{id}/logs?source=&tail=` | the end of a session's log, as text; works for stopped sessions |
 | `POST /v1/shutdown` | stop the daemon |
 | `POST /v1/images/prepare` | build missing browser images; streams newline-delimited JSON progress |
@@ -506,6 +578,9 @@ table above.
 | `LOCALIMAGE_BIN` | the installed binary | path of a `localimage` binary to use instead of the one in the installed package (development) |
 | `LOCALIMAGE_ADDR` | `127.0.0.1:7777` | daemon address (CLI and SDKs) |
 | `LOCALIMAGE_API_KEY` | generated file | the control API key; by default a private key file is created and read by the CLI and SDKs |
+| `LOCALIMAGE_CONFIG_DIR` | platform config directory | shared parent directory for the generated key file (`<dir>/localimage/api-key`) |
+| `LOCALIMAGE_TLS_CERT` | unset | TLS certificate PEM file; enables HTTPS for the daemon and all proxy URLs |
+| `LOCALIMAGE_TLS_KEY` | unset | TLS private key PEM file; must be set with `LOCALIMAGE_TLS_CERT` |
 | `LOCALIMAGE_NO_AUTH` | unset | `1` turns authentication off |
 | `LOCALIMAGE_ALLOWED_HOSTS`, `LOCALIMAGE_ALLOWED_ORIGINS` | unset | extra Host names / browser origins the daemon accepts |
 | `LOCALIMAGE_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -521,9 +596,25 @@ table above.
 - **The control API is authenticated by default.** On first start the daemon generates a random key
   and keeps it in a file only your user can read (`~/.config/localimage/api-key`, or the platform's
   equivalent). The CLI and both SDKs read the same file, so you configure nothing; other users on the
-  machine cannot call the daemon. Set `LOCALIMAGE_API_KEY` to choose your own key (for `curl`, send
-  `Authorization: Bearer <key>`), or `LOCALIMAGE_NO_AUTH=1` to turn authentication off (not
-  recommended). `/healthz` and the live-view token URLs do not use the key.
+  machine cannot call the daemon. The generated key file is owner-only on Unix and uses a
+  protected owner-only Windows ACL. Set `LOCALIMAGE_API_KEY` to choose your own key. For direct HTTP
+  requests, send an `Authorization: Bearer` header containing that key, or set `LOCALIMAGE_NO_AUTH=1` to
+  turn authentication off (not recommended). `/healthz` and the live-view token URLs do not use the key. Use
+  `POST /v1/auth/rotate-key` (or `rotateKey()` / `rotate_key()`) to immediately replace the
+  generated key. The new key is returned once; clients using the old key must reload it. Keys
+  configured through `LOCALIMAGE_API_KEY` are rotated by changing that variable and restarting.
+  Set `LOCALIMAGE_CONFIG_DIR` to an explicit shared directory when the daemon and SDK run with
+  different home/config environments; all clients must use the same value.
+  Set `LOCALIMAGE_TLS_CERT` and `LOCALIMAGE_TLS_KEY` together to serve the control API, live view,
+  CDP, and Playwright proxy over HTTPS. SDK clients may use `https://host:port` in `addr`; returned
+  Chromium and Playwright URLs use `wss://` where appropriate. Certificate verification is enabled
+  by default; use a certificate trusted by the client rather than disabling verification.
+- Session lifetimes are enforced by a background reaper in the running daemon. The reaper checks
+  every 15 seconds. If the daemon is stopped or crashes, or Docker is unavailable, a session keeps
+  running past its lifetime because there is no independent expiry process. When the daemon starts
+  again and reconnects to Docker, it removes expired sessions during a subsequent reaper pass.
+  `localimage doctor` warns when sessions are past their lifetime and no daemon is running.
+  Lifetimes cannot be extended.
 - **Web pages cannot drive the daemon.** Any page you visit could otherwise send requests to
   `http://127.0.0.1:7777`. The daemon refuses a request whose `Host` is not an IP address or
   `localhost` (the DNS-rebinding case), any request carrying a foreign `Origin`, and writes with a
@@ -537,17 +628,29 @@ table above.
   and cannot reach CDP. **Treat these URLs like passwords.** The daemon log never contains them.
 - Anyone with the API key can run commands and read files in your session containers. Sessions are
   containers, not a hardened sandbox for hostile code.
+- Do not run untrusted websites, extensions, test code, or browser content in a daemon that can
+  access sensitive host resources or credentials. `exec`, file upload/download, persistent profiles,
+  extensions, and browser control can expose or modify session data.
 - WebRTC video cannot go through the HTTP proxy: each session also opens one media port on the
   host (the same number inside and outside the container).
-- There is no TLS. Do not expose the daemon to untrusted networks.
+- TLS is opt-in. Set `LOCALIMAGE_TLS_CERT` and `LOCALIMAGE_TLS_KEY` together to serve the control
+  API, live view, CDP, and Playwright proxy over HTTPS/WSS. Without TLS, do not expose the daemon
+  or bearer session URLs to untrusted networks.
 - The release workflow pins every action to a commit (updated by hand), publishes npm
   packages with provenance, and attests the release binaries, on public repositories.
 
 ### Upgrading from 0.2.x
 
 Authentication is now on by default. The CLI and SDKs need no change. Anything else that called the
-API directly (`curl`, another language) must send the key: `-H "Authorization: Bearer $(cat
-~/.config/localimage/api-key)"` and `-H "Content-Type: application/json"` for writes.
+API directly (`curl`, another language) must send the key, for example:
+
+```bash
+KEY="$(cat ~/.config/localimage/api-key)"
+curl \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:7777/v1/info
+```
 
 ## Troubleshooting
 
@@ -555,7 +658,13 @@ API directly (`curl`, another language) must send the key: `-H "Authorization: B
 - **Black or frozen live view:** a VPN, firewall or browser extension that blocks WebRTC. Try a
   private window with extensions off, and open the page at `127.0.0.1:7777`.
 - **Remote use:** set `LOCALIMAGE_PUBLIC_IP` to an address the viewer can reach, bind the daemon
-  to a non-loopback address and set `LOCALIMAGE_API_KEY`. This setup is not tested yet.
+  to a non-loopback address and set `LOCALIMAGE_API_KEY`. Remote use is experimental, not a
+  supported production deployment. Open the daemon's configured TCP port and, for every active
+  session, the WebRTC media port over both UDP and TCP. `LOCALIMAGE_PUBLIC_IP` must be a reachable
+  address; it is not sufficient when NAT, firewalls, or multiple interfaces require port forwarding
+  or interface-specific routing. Reverse proxies are not supported for live view or CDP/Playwright
+  proxy URLs. TLS and API-key authentication are required for any remote configuration; do not use
+  `LOCALIMAGE_NO_AUTH` remotely.
 - **"profile is already in use":** a Chromium profile can only be open in one session at a time.
 - **Firefox connect fails with a version error:** match Playwright to the image's version.
 
@@ -573,7 +682,8 @@ Known limits:
 - **An app listening only on `127.0.0.1`** cannot be reached from the browser (see
   "Reaching an app on your machine").
 - **Firefox** loses its pages when a connection ends; it has no WebGL option, locale option or kiosk mode.
-- No TLS, warm browser pools, standby, stealth or proxy options, WebKit, or multi-host scaling.
+- No warm browser pools, standby, stealth or proxy options, WebKit, or multi-host scaling. TLS is
+  available as an opt-in configuration but has not been validated for remote deployment.
 
 ## Development
 

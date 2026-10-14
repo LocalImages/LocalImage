@@ -17,11 +17,13 @@ const abortReason = (signal) => signal.reason ?? new DOMException('This operatio
 const pick = ({ raw, signal, timeoutMs } = {}) => ({ raw, signal, timeoutMs });
 
 const DEFAULT_ADDR = process.env.LOCALIMAGE_ADDR ?? '127.0.0.1:7777';
+const daemonURL = (addr) => `${addr.includes('://') ? addr : `http://${addr}`}/healthz`;
+const listenAddr = (addr) => new URL(addr.includes('://') ? addr : `http://${addr}`).host;
 
 // Resolves to { pid } when a daemon answers at addr (pid is null for an old daemon), else null.
 async function healthy(addr) {
   try {
-    const r = await fetch(`http://${addr}/healthz`, { signal: AbortSignal.timeout(1500) });
+    const r = await fetch(daemonURL(addr), { signal: AbortSignal.timeout(1500) });
     if (!r.ok) return null;
     const body = await r.json().catch(() => ({}));
     return { pid: body.pid ?? null };
@@ -58,7 +60,7 @@ export async function ensureDaemon({ addr = DEFAULT_ADDR, apiKey, env = {}, time
   let exitCode = null;
   let child;
   try {
-    child = spawn(bin, ['start', '-addr', addr], {
+    child = spawn(bin, ['start', '-addr', listenAddr(addr)], {
       detached: true,
       stdio: ['ignore', fd, fd],
       windowsHide: true,
@@ -168,6 +170,13 @@ export class LocalImage {
       if (e instanceof LocalImageError && e.code === 'daemon_unreachable') return false;
       throw e;
     }
+  }
+
+  /** Generate and activate a new daemon API key. The previous key stops working immediately. */
+  async rotateKey(opts) {
+    const result = await this._call('POST', '/v1/auth/rotate-key', undefined, pick(opts));
+    if (this._apiKey !== undefined) this._apiKey = result.api_key;
+    return result.api_key;
   }
 
   /**

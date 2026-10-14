@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import { LocalImageError } from './errors.js';
 
 // Node's built-in fetch gives up on a response after 5 minutes of silence, and reports it as a
@@ -8,8 +9,8 @@ import { LocalImageError } from './errors.js';
 const UNREACHABLE = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'ECONNRESET', 'EPIPE']);
 
 function splitAddr(addr) {
-  const i = addr.lastIndexOf(':');
-  return i < 0 ? { hostname: addr, port: 80 } : { hostname: addr.slice(0, i).replace(/^\[|\]$/g, ''), port: Number(addr.slice(i + 1)) };
+  const url = new URL(addr.includes('://') ? addr : `http://${addr}`);
+  return { hostname: url.hostname, port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80), protocol: url.protocol };
 }
 
 const abortReason = (signal) => signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
@@ -30,7 +31,7 @@ export function request(addr, apiKey, method, path, body, { raw = false, signal,
 
     const isBinary = body instanceof Uint8Array;
     const payload = body === undefined ? null : isBinary ? Buffer.from(body) : Buffer.from(JSON.stringify(body));
-    const { hostname, port } = splitAddr(addr);
+    const { hostname, port, protocol } = splitAddr(addr);
 
     let settled = false;
     let timer;
@@ -42,7 +43,8 @@ export function request(addr, apiKey, method, path, body, { raw = false, signal,
       fn(value);
     };
 
-    const req = http.request(
+    const request = protocol === 'https:' ? https.request : http.request;
+    const req = request(
       {
         hostname,
         port,

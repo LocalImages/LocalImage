@@ -139,10 +139,20 @@ func zipToTar(data []byte) (*bytes.Buffer, *manifest, error) {
 	return &out, &man, nil
 }
 
+// extSlots bounds concurrent extension uploads.
+var extSlots = make(chan struct{}, 2)
+
 // AddExtension stores (or replaces) the extension called name from a zip.
 func (m *Manager) AddExtension(ctx context.Context, name string, zipData []byte) (*Extension, error) {
 	if !profileName.MatchString(name) {
 		return nil, invalid("invalid extension name %q (use a-z, 0-9, - and _)", name)
+	}
+	// Unpacking holds the whole extension in memory (up to maxUnzipBytes), so only a couple at a time.
+	select {
+	case extSlots <- struct{}{}:
+		defer func() { <-extSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 	tarball, man, err := zipToTar(zipData)
 	if err != nil {

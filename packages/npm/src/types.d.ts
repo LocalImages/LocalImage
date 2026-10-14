@@ -99,7 +99,7 @@ export interface PrepareOptions extends CallOptions {
 export type PrepareResult = Partial<Record<BrowserName, 'ready' | 'built'>>;
 
 export interface LocalImageOptions {
-  /** Daemon address. Default LOCALIMAGE_ADDR or `127.0.0.1:7777`. */
+  /** Daemon address. Default LOCALIMAGE_ADDR or `127.0.0.1:7777`; use `https://host:port` for TLS. */
   addr?: string | undefined;
   /** Default LOCALIMAGE_API_KEY. */
   apiKey?: string | undefined;

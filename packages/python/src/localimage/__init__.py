@@ -19,6 +19,15 @@ DEFAULT_ADDR = os.environ.get("LOCALIMAGE_ADDR", "127.0.0.1:7777")
 _DEFAULT = object()  # "use the client's default timeout"
 
 
+def _url(addr: str, path: str) -> str:
+    base = addr if "://" in addr else f"http://{addr}"
+    return base.rstrip("/") + path
+
+
+def _listen_addr(addr: str) -> str:
+    return urllib.parse.urlsplit(addr if "://" in addr else f"http://{addr}").netloc
+
+
 class LocalImageError(RuntimeError):
     """Every failure is a LocalImageError with a stable ``code``, so callers can branch without
     parsing messages. Codes from the daemon:
@@ -53,7 +62,7 @@ class LocalImageError(RuntimeError):
 def _healthy(addr: str):
     """{"pid": int | None} when a daemon answers at addr (pid is None for an old daemon), else None."""
     try:
-        with urllib.request.urlopen(f"http://{addr}/healthz", timeout=1.5) as r:
+        with urllib.request.urlopen(_url(addr, "/healthz"), timeout=1.5) as r:
             if r.status != 200:
                 return None
             try:
@@ -97,7 +106,7 @@ def ensure_daemon(addr: str = DEFAULT_ADDR, api_key: Optional[str] = None, env: 
         kwargs["start_new_session"] = True
     with open(log, "ab") as out:
         try:
-            proc = subprocess.Popen([binary, "start", "-addr", addr], stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen([binary, "start", "-addr", _listen_addr(addr)], stdin=subprocess.DEVNULL,
                                     stdout=out, stderr=out, env=child_env, **kwargs)
         except OSError as e:
             raise LocalImageError(f"could not run {binary}: {e}", code="daemon_start_failed") from None
@@ -304,7 +313,7 @@ class LocalImage:
         if data is None and body is not None:
             data = json.dumps(body).encode()
         req = urllib.request.Request(
-            f"http://{self.addr}{path}", data=data, method=method,
+            _url(self.addr, path), data=data, method=method,
             headers={"Content-Type": "application/octet-stream" if body is None and data is not None
                      else "application/json",
                      **({"Authorization": f"Bearer {self._key()}"} if self._key() else {})},
@@ -363,7 +372,7 @@ class LocalImage:
         """
         body = json.dumps({"browsers": browsers or ["chromium"]}).encode()
         req = urllib.request.Request(
-            f"http://{self.addr}/v1/images/prepare", data=body, method="POST",
+            _url(self.addr, "/v1/images/prepare"), data=body, method="POST",
             headers={"Content-Type": "application/json",
                      **({"Authorization": f"Bearer {self._key()}"} if self._key() else {})})
         last = None
@@ -410,6 +419,13 @@ class LocalImage:
             if e.code == "daemon_unreachable":
                 return False
             raise
+
+    def rotate_key(self) -> str:
+        """Generate and activate a new daemon API key; the previous key stops working immediately."""
+        key = self._call("POST", "/v1/auth/rotate-key")["api_key"]
+        if self.api_key is not None:
+            self.api_key = key
+        return key
 
     def info(self) -> dict:
         """The daemon's version, limits and load:

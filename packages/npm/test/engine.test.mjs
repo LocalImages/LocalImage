@@ -242,7 +242,7 @@ t('the SDK objects have exactly the declared members (src/index.d.ts and test/ty
     'downloadFile', 'listFiles', 'close', 'logs', 'health', 'updateTags', 'saveLogs',
   ];
   const CLIENT_KEYS = [
-    'addr', 'apiKey', 'autoStart', 'daemonEnv', 'ensureDaemon', 'shutdown', 'info', 'assertCapacity', 'prepare',
+    'addr', 'apiKey', 'autoStart', 'daemonEnv', 'ensureDaemon', 'shutdown', 'rotateKey', 'info', 'assertCapacity', 'prepare',
     'create', 'list', 'delete', 'uploadExtension', 'extensions', 'deleteExtension', 'profiles', 'deleteProfile',
     'attach', 'assertCompatible', 'prune',
   ];

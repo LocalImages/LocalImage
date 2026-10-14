@@ -31,6 +31,13 @@ const t = (name, fn) => test(name, { skip, timeout: 400_000 }, fn);
 const up = () => fetch(`http://${ADDR}/healthz`, { signal: AbortSignal.timeout(1500) }).then((r) => r.ok, () => false);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const errorOf = (p) => p.then(() => null, (e) => e);
+const managedContainerExists = (id) => {
+  try {
+    return Boolean(execFileSync('docker', ['ps', '-q', '--filter', `label=localimage.id=${id}`], { encoding: 'utf8' }).trim());
+  } catch {
+    return false;
+  }
+};
 // Every test that needs the daemon makes sure it is up, so tests do not depend on running in order.
 const daemon = () => ensureDaemon({ addr: ADDR, env });
 
@@ -95,6 +102,23 @@ t('autoStart brings a stopped daemon back transparently, and shutdown is idempot
   for (let i = 0; i < 50 && (await up()); i++) await sleep(100);
   assert.equal((await errorOf(li.info())).code, 'daemon_unreachable');
   await ensureDaemon({ addr: ADDR, env });
+});
+
+t('an expired session is removed when a daemon is running again', async () => {
+  await li.shutdown();
+  for (let i = 0; i < 50 && (await up()); i++) await sleep(100);
+  const started = await ensureDaemon({ addr: ADDR, env });
+  const s = await li.create({ ttlSeconds: 8 });
+  assert.equal(managedContainerExists(s.id), true, 'the session container exists');
+  // Lifetimes are enforced by the daemon, so a killed daemon leaves the session running...
+  process.kill(started.pid, 'SIGKILL');
+  for (let i = 0; i < 50 && (await up()); i++) await sleep(100);
+  await sleep(9_000);
+  assert.equal(managedContainerExists(s.id), true, 'nothing removes it while no daemon runs');
+  // ...and the next daemon removes it.
+  await ensureDaemon({ addr: ADDR, env });
+  for (let i = 0; i < 100 && managedContainerExists(s.id); i++) await sleep(250);
+  assert.equal(managedContainerExists(s.id), false, 'the new daemon removed the expired session');
 });
 
 t('tags: stored on the session, returned by list, usable as filters; sweep finds leftovers', async () => {

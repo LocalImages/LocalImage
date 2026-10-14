@@ -79,7 +79,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.forward(w, r, "127.0.0.1:"+rec.WebPort, r.URL.Path, false, nil)
 	case kind == "cdp" && rec.Protocol == session.ProtocolCDP:
 		prefix := "/t/" + token + "/cdp/"
-		p.forward(w, r, "127.0.0.1:"+rec.BackendPort, "/"+sub, true, rewriteWS(r.Host, rec.BackendPort, prefix))
+		p.forward(w, r, "127.0.0.1:"+rec.BackendPort, "/"+sub, true, rewriteWS(r, rec.BackendPort, prefix))
 	case kind == "pw" && rec.Protocol == session.ProtocolPlaywright:
 		p.forward(w, r, "127.0.0.1:"+rec.BackendPort, "/pw", true, nil)
 	default:
@@ -122,7 +122,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target, path str
 
 // rewriteWS rewrites the webSocketDebuggerUrl values in Chromium's /json
 // responses so they point back at the proxy.
-func rewriteWS(clientHost, backendPort, prefix string) func(*http.Response) error {
+func rewriteWS(r *http.Request, backendPort, prefix string) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		if !strings.HasPrefix(resp.Request.URL.Path, "/json") || resp.StatusCode != http.StatusOK {
 			return nil
@@ -133,7 +133,11 @@ func rewriteWS(clientHost, backendPort, prefix string) func(*http.Response) erro
 			return err
 		}
 		old := []byte("ws://127.0.0.1:" + backendPort + "/")
-		body = bytes.ReplaceAll(body, old, []byte("ws://"+clientHost+prefix))
+		scheme := "ws"
+		if r.TLS != nil {
+			scheme = "wss"
+		}
+		body = bytes.ReplaceAll(body, old, []byte(scheme+"://"+r.Host+prefix))
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		resp.ContentLength = int64(len(body))
 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))

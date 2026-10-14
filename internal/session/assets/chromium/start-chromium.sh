@@ -10,6 +10,9 @@ if [ "$LOCALIMAGE_WEBGL" = "1" ]; then
   GL="--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist"
 fi
 
+# BackForwardCache is off so that back and forward navigation reloads pages the way a test expects,
+# instead of restoring a frozen copy.
+#
 # LOCALIMAGE_LANG sets the browser language (for example de-DE): the UI language and the
 # accept-languages list that navigator.language and the Accept-Language header come from; LOCALIMAGE_CHROMIUM_ARGS holds
 # extra flags such as --kiosk and --load-extension.
@@ -23,6 +26,7 @@ exec /usr/bin/chromium \
   --disable-dev-shm-usage \
   --remote-debugging-port=9223 \
   --remote-allow-origins='*' \
+  --disable-features=BackForwardCache \
   ${LOCALIMAGE_LANG:+--lang=$LOCALIMAGE_LANG --accept-lang=$LOCALIMAGE_LANG} \
   $GL \
   $LOCALIMAGE_CHROMIUM_ARGS

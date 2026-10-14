@@ -3,7 +3,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -16,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LocalImages/LocalImage/internal/auth"
 	"github.com/LocalImages/LocalImage/internal/proxy"
 	"github.com/LocalImages/LocalImage/internal/session"
 )
@@ -23,6 +23,7 @@ import (
 type Server struct {
 	mgr        *session.Manager
 	apiKey     string // optional; guards /v1 when set
+	keyMu      sync.RWMutex
 	version    string
 	onShutdown func() // called by POST /v1/shutdown; may be nil
 }
@@ -41,9 +42,12 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return logged(func(w http.ResponseWriter, r *http.Request) {
-		if s.apiKey != "" {
+		s.keyMu.RLock()
+		key := s.apiKey
+		s.keyMu.RUnlock()
+		if key != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.apiKey)) != 1 {
+			if subtle.ConstantTimeCompare([]byte(got), []byte(key)) != 1 {
 				fail(w, http.StatusUnauthorized, errUnauthorized)
 				return
 			}
@@ -63,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions", s.auth(s.create))
 	mux.HandleFunc("GET /v1/info", s.auth(s.info))
 	mux.HandleFunc("POST /v1/shutdown", s.auth(s.shutdown))
+	mux.HandleFunc("POST /v1/auth/rotate-key", s.auth(s.rotateKey))
 	mux.HandleFunc("POST /v1/images/prepare", s.auth(s.prepare))
 	mux.HandleFunc("GET /v1/sessions", s.auth(s.list))
 	mux.HandleFunc("GET /v1/sessions/{id}", s.auth(s.get))
@@ -96,6 +101,22 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/t/{token}/", px)
 	mux.Handle("/v/{token}/", px)
 	return newGuard().wrap(mux)
+}
+
+func (s *Server) rotateKey(w http.ResponseWriter, _ *http.Request) {
+	if os.Getenv("LOCALIMAGE_API_KEY") != "" {
+		fail(w, http.StatusConflict, apiError("cannot rotate a key configured with LOCALIMAGE_API_KEY; update the environment and restart"))
+		return
+	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	key, err := auth.Rotate()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.apiKey = key
+	writeJSON(w, http.StatusOK, map[string]string{"api_key": key})
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +169,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, rec.View(r.Host))
+	writeJSON(w, http.StatusCreated, rec.View(r.Host, r.TLS != nil))
 }
 
 // prepare builds the browser images that are missing, so the first session does not have to.
@@ -333,7 +354,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]*session.Session, 0, len(recs))
 	for _, rec := range recs {
-		out = append(out, rec.View(r.Host))
+		out = append(out, rec.View(r.Host, r.TLS != nil))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -344,7 +365,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, rec.View(r.Host))
+	writeJSON(w, http.StatusOK, rec.View(r.Host, r.TLS != nil))
 }
 
 func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
@@ -399,14 +420,13 @@ func (s *Server) recList(w http.ResponseWriter, r *http.Request) {
 // recDownload serves one recording; without {rid} it serves the latest.
 func (s *Server) recDownload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var buf bytes.Buffer
-	if _, err := s.mgr.DownloadRecording(r.Context(), id, r.PathValue("rid"), &buf); err != nil {
-		fail(w, http.StatusNotFound, err)
-		return
+	out := &startWriter{w: w, start: func() {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+id+`.mp4"`)
+	}}
+	if _, err := s.mgr.DownloadRecording(r.Context(), id, r.PathValue("rid"), out); err != nil {
+		out.fail(err)
 	}
-	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+id+`.mp4"`)
-	_, _ = w.Write(buf.Bytes())
 }
 
 func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
@@ -437,13 +457,35 @@ func (s *Server) fileUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fileDownload(w http.ResponseWriter, r *http.Request) {
-	var buf bytes.Buffer
-	if _, err := s.mgr.DownloadFile(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"), &buf); err != nil {
-		fail(w, http.StatusNotFound, err)
+	out := &startWriter{w: w, start: func() { w.Header().Set("Content-Type", "application/octet-stream") }}
+	if _, err := s.mgr.DownloadFile(r.Context(), r.PathValue("id"), r.URL.Query().Get("path"), out); err != nil {
+		out.fail(err)
+	}
+}
+
+// startWriter streams a download straight to the client instead of buffering it. Nothing is sent
+// until the first byte is ready, so an error before that can still be a proper 404; once data
+// has started the status is already sent, so the only honest signal left is to cut the connection.
+type startWriter struct {
+	w       http.ResponseWriter
+	start   func()
+	started bool
+}
+
+func (s *startWriter) Write(p []byte) (int, error) {
+	if !s.started {
+		s.started = true
+		s.start()
+	}
+	return s.w.Write(p)
+}
+
+func (s *startWriter) fail(err error) {
+	if !s.started {
+		fail(s.w, http.StatusNotFound, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	_, _ = w.Write(buf.Bytes())
+	panic(http.ErrAbortHandler)
 }
 
 func (s *Server) fileList(w http.ResponseWriter, r *http.Request) {

@@ -61,7 +61,7 @@ const (
 	FirefoxVersion  = "155.0" // the Firefox build that Playwright PlaywrightVersion (1.63.0) ships
 
 	// Image revisions are bumped when the matching assets/ change, forcing a rebuild.
-	chromiumRev = "r11"
+	chromiumRev = "r12"
 	firefoxRev  = "r7"
 )
 
@@ -124,19 +124,23 @@ type Session struct {
 }
 
 // View renders the record for a client that reached the daemon at host.
-func (r *Record) View(host string) *Session {
+func (r *Record) View(host string, secure bool) *Session {
+	scheme, wsScheme := "http", "ws"
+	if secure {
+		scheme, wsScheme = "https", "wss"
+	}
 	base := "/t/" + r.Token
-	connect := "http://" + host + base + "/cdp"
+	connect := scheme + "://" + host + base + "/cdp"
 	if r.Protocol == ProtocolPlaywright {
-		connect = "ws://" + host + base + "/pw"
+		connect = wsScheme + "://" + host + base + "/pw"
 	}
 	return &Session{
 		ID:           r.ID,
 		Browser:      r.Browser,
 		Protocol:     r.Protocol,
 		ConnectURL:   connect,
-		LiveURL:      "http://" + host + base + "/live/?usr=controller&pwd=" + r.AdminPwd + "&embed=1",
-		ViewURL:      "http://" + host + "/v/" + r.ViewToken + "/?usr=viewer&pwd=" + r.ViewerPwd + "&cast=1",
+		LiveURL:      scheme + "://" + host + base + "/live/?usr=controller&pwd=" + r.AdminPwd + "&embed=1",
+		ViewURL:      scheme + "://" + host + "/v/" + r.ViewToken + "/?usr=viewer&pwd=" + r.ViewerPwd + "&cast=1",
 		Profile:      r.Profile,
 		Extensions:   r.Extensions,
 		Tags:         r.Tags,
@@ -642,7 +646,16 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Record, erro
 		cleanup()
 		return nil, err
 	}
-	if err := waitReady(ctx, rec, 90*time.Second); err != nil {
+
+	readyTimeout := 90 * time.Second
+	if until := time.Until(expires); until < readyTimeout {
+		readyTimeout = until
+	}
+	if readyTimeout <= 0 {
+		cleanup()
+		return nil, fmt.Errorf("session expired before it became ready")
+	}
+	if err := waitReady(ctx, rec, readyTimeout); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -899,18 +912,42 @@ func (m *Manager) DeleteProfile(ctx context.Context, name string) error {
 	return m.cli.VolumeRemove(ctx, profileVolume(name), false)
 }
 
+// reapParallel is how many expired sessions are removed at once. Stopping a session with a
+// saved profile can take 20 seconds, which must not hold up the others.
+const reapParallel = 8
+
 // Reap removes sessions whose TTL has passed.
 func (m *Manager) Reap(ctx context.Context) {
 	list, err := m.List(ctx, nil)
 	if err != nil {
 		return
 	}
+	now := time.Now()
+	var expired []string
 	for _, r := range list {
-		if !r.ExpiresAt.IsZero() && time.Now().After(r.ExpiresAt) {
-			slog.Info("session expired", "id", r.ID)
-			_ = m.Delete(ctx, r.ID)
+		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+			expired = append(expired, r.ID)
 		}
 	}
+	runLimited(reapParallel, expired, func(id string) {
+		slog.Info("session expired", "id", id)
+		_ = m.Delete(ctx, id)
+	})
+}
+
+// runLimited calls fn for every item, at most limit at a time, and returns when all are done.
+func runLimited[T any](limit int, items []T, fn func(T)) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, limit)
+	for _, it := range items {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			fn(it)
+		}()
+	}
+	wg.Wait()
 }
 
 func splitNonEmpty(s string) []string {

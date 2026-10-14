@@ -6,6 +6,7 @@ import { join } from 'node:path';
 // read. The SDK reads the same file, so the same user needs no configuration, while other users and
 // web pages cannot call the daemon. This mirrors Go's os.UserConfigDir.
 function configDir() {
+  if (process.env.LOCALIMAGE_CONFIG_DIR) return process.env.LOCALIMAGE_CONFIG_DIR;
   if (platform() === 'win32') return process.env.AppData ?? join(homedir(), 'AppData', 'Roaming');
   if (platform() === 'darwin') return join(homedir(), 'Library', 'Application Support');
   return process.env.XDG_CONFIG_HOME || join(homedir(), '.config');

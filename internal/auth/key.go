@@ -11,15 +11,19 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
-// Path is where the key lives: <user config dir>/localimage/api-key.
+// Path is where the key lives: <config dir>/localimage/api-key. LOCALIMAGE_CONFIG_DIR
+// overrides the platform default so the daemon and SDKs can share an explicit location.
 func Path() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
+	dir := os.Getenv("LOCALIMAGE_CONFIG_DIR")
+	if dir == "" {
+		var err error
+		dir, err = os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
 	}
 	return filepath.Join(dir, "localimage", "api-key"), nil
 }
@@ -30,7 +34,9 @@ func Read() string {
 	if err != nil {
 		return ""
 	}
-	tightenMode(p)
+	if err := secureKeyFile(p); err != nil {
+		return ""
+	}
 	b, err := os.ReadFile(p)
 	if err != nil {
 		return ""
@@ -43,6 +49,7 @@ func LoadOrCreate() (string, error) {
 	if k := Read(); k != "" {
 		return k, nil
 	}
+
 	p, err := Path()
 	if err != nil {
 		return "", err
@@ -71,6 +78,61 @@ func LoadOrCreate() (string, error) {
 	if _, err := f.WriteString(key + "\n"); err != nil {
 		return "", err
 	}
+	if err := secureKeyFile(p); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// Rotate replaces the persisted key and returns the new value.
+func Rotate() (string, error) {
+	p, err := Path()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return "", err
+	}
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	key := hex.EncodeToString(raw)
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".api-key-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if _, err := tmp.WriteString(key + "\n"); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := secureKeyFile(tmpName); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+		if err := os.Remove(p); err != nil {
+			return "", err
+		}
+		if err := os.Rename(tmpName, p); err != nil {
+			return "", err
+		}
+	}
 	return key, nil
 }
 
@@ -80,16 +142,4 @@ func Resolve() string {
 		return k
 	}
 	return Read()
-}
-
-// tightenMode makes a key file readable by its owner only. Something else (a backup tool, a manual
-// copy) may have created or loosened it, and a key other users can read protects nothing. It is
-// best effort and does nothing on Windows, where file modes are not permissions.
-func tightenMode(path string) {
-	if runtime.GOOS == "windows" {
-		return
-	}
-	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
-		_ = os.Chmod(path, 0o600)
-	}
 }

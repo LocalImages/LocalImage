@@ -2,6 +2,7 @@ package auth
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -21,6 +22,7 @@ func TestLoadOrCreateMakesAPrivateKeyOnce(t *testing.T) {
 	if Read() != "" {
 		t.Fatal("a key exists before one was created")
 	}
+
 	k1, err := LoadOrCreate()
 	if err != nil {
 		t.Fatal(err)
@@ -53,12 +55,52 @@ func TestResolvePrefersTheEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if Resolve() != stored {
 		t.Error("with no env key, the stored key is used")
 	}
 	t.Setenv("LOCALIMAGE_API_KEY", "explicit")
 	if Resolve() != "explicit" {
 		t.Error("an explicit key must win over the file")
+	}
+}
+
+func TestConfigDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LOCALIMAGE_CONFIG_DIR", dir)
+	t.Setenv("LOCALIMAGE_API_KEY", "")
+	key, err := LoadOrCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "localimage", "api-key")
+	if p != want {
+		t.Fatalf("Path = %q, want %q", p, want)
+	}
+	if got := Read(); got != key {
+		t.Fatalf("Read = %q, want %q", got, key)
+	}
+}
+
+func TestRotateReplacesStoredKey(t *testing.T) {
+	useTempConfig(t)
+	old, err := LoadOrCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := Rotate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == old || len(next) < 32 {
+		t.Fatalf("rotated key = %q; want a new key", next)
+	}
+	if got := Read(); got != next {
+		t.Fatalf("Read = %q; want %q", got, next)
 	}
 }
 

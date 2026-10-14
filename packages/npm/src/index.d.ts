@@ -168,6 +168,8 @@ export declare class LocalImage {
   ensureDaemon(opts?: EnsureDaemonOptions): Promise<EnsureDaemonResult>;
   /** Stop the daemon. Resolves true if one was stopped, false if none was running. */
   shutdown(opts?: CallOptions): Promise<boolean>;
+  /** Generate and activate a new daemon API key; the previous key stops working immediately. */
+  rotateKey(opts?: CallOptions): Promise<string>;
   /** The daemon's version, limits (`maxSessions`) and load. */
   info(opts?: CallOptions): Promise<Info>;
   /**

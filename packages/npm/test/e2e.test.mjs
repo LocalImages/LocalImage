@@ -142,28 +142,52 @@ for (const browser of ['chromium', 'firefox']) {
           ];
         }, [sel, fx, fy]);
 
+      // Input goes in through the operating system, so its effect arrives a moment later, and the
+      // window may still be settling after it opens. Wait for the layout to hold still before
+      // measuring, and wait for each result instead of reading it the instant the action returns.
+      const settled = async () => {
+        let last = '';
+        for (let stable = 0; stable < 3; ) {
+          const now = JSON.stringify(await toScreen('#b'));
+          stable = now === last ? stable + 1 : 0;
+          last = now;
+          await p.waitForTimeout(200);
+        }
+      };
+      const eventually = async (read, ok, what) => {
+        let v;
+        for (let i = 0; i < 40; i++) {
+          v = await read();
+          if (ok(v)) return v;
+          await p.waitForTimeout(150);
+        }
+        assert.fail(`${what}: gave up waiting, last value ${JSON.stringify(v)}`);
+      };
+      await settled();
+
       const [bx, by] = await toScreen('#b');
       await s.click(bx, by);
-      assert.equal(await p.getAttribute('#b', 'data-n'), '1', 'button clicked');
+      await eventually(() => p.getAttribute('#b', 'data-n'), (v) => v === '1', 'button clicked');
       await s.click(bx, by, { numClicks: 2 });
-      assert.equal(await p.getAttribute('#b', 'data-n'), '3', 'double click adds two');
+      await eventually(() => p.getAttribute('#b', 'data-n'), (v) => v === '3', 'double click adds two');
 
       const [ix, iy] = await toScreen('#i');
       await s.click(ix, iy);
+      await eventually(() => p.evaluate(() => document.activeElement?.id), (v) => v === 'i', 'input focused');
       await s.type('hello world');
-      assert.equal(await p.inputValue('#i'), 'hello world', 'typed text');
+      await eventually(() => p.inputValue('#i'), (v) => v === 'hello world', 'typed text');
       await s.pressKey('ctrl+a');
       await s.type('X');
-      assert.equal(await p.inputValue('#i'), 'X', 'select-all then replace');
+      await eventually(() => p.inputValue('#i'), (v) => v === 'X', 'select-all then replace');
 
       const [dx, dy] = await toScreen('#d', 0.2, 0.2);
       await s.drag([[dx, dy], [dx + 80, dy + 40], [dx + 160, dy + 60]]);
-      const ev = await p.evaluate(() => window.ev);
+      const ev = await eventually(() => p.evaluate(() => window.ev), (v) => v.length >= 2, 'drag events');
       assert.deepEqual(ev.map((e) => e[0]), ['down', 'up'], 'drag fires down then up');
       assert.ok(ev[1][1] - ev[0][1] > 100, 'mouse moved right while dragging');
 
       await s.scroll(dx, dy, { deltaY: 10 });
-      assert.ok((await p.evaluate(() => window.scrollY)) > 0, 'page scrolled');
+      await eventually(() => p.evaluate(() => window.scrollY), (v) => v > 0, 'page scrolled');
 
       const crop = await s.screenshot({ x: 0, y: 0, width: 200, height: 100 });
       assert.equal(crop.readUInt32BE(16), 200, 'cropped width');

@@ -130,7 +130,7 @@ const SESSION_KEYS = [
   'downloadFile', 'listFiles', 'close', 'logs', 'health', 'updateTags', 'saveLogs',
 ] as const;
 const CLIENT_KEYS = [
-  'addr', 'apiKey', 'autoStart', 'daemonEnv', 'ensureDaemon', 'shutdown', 'info', 'assertCapacity', 'prepare',
+  'addr', 'apiKey', 'autoStart', 'daemonEnv', 'ensureDaemon', 'shutdown', 'rotateKey', 'info', 'assertCapacity', 'prepare',
   'create', 'list', 'delete', 'uploadExtension', 'extensions', 'deleteExtension', 'profiles', 'deleteProfile',
   'attach', 'assertCompatible', 'prune',
 ] as const;

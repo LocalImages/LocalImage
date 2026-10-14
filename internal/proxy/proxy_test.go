@@ -16,7 +16,7 @@ func TestRewriteWS(t *testing.T) {
 		Request:    &http.Request{URL: &url.URL{Path: "/json/list"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
-	if err := rewriteWS("daemon:7777", "32769", "/t/tok/cdp/")(resp); err != nil {
+	if err := rewriteWS(&http.Request{Host: "daemon:7777"}, "32769", "/t/tok/cdp/")(resp); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := io.ReadAll(resp.Body)
@@ -37,7 +37,7 @@ func TestRewriteWSLeavesOtherPathsAlone(t *testing.T) {
 		Request:    &http.Request{URL: &url.URL{Path: "/devtools/browser/1"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
-	if err := rewriteWS("daemon:7777", "32769", "/t/tok/cdp/")(resp); err != nil {
+	if err := rewriteWS(&http.Request{Host: "daemon:7777"}, "32769", "/t/tok/cdp/")(resp); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := io.ReadAll(resp.Body); string(got) != body {

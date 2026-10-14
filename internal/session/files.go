@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -122,12 +123,23 @@ func (m *Manager) UploadFile(ctx context.Context, id, p string, r io.Reader) (in
 	if p == "/" {
 		return 0, fmt.Errorf("path must name a file")
 	}
-	data, err := io.ReadAll(io.LimitReader(r, maxUpload+1))
+	// Spool to a temporary file rather than memory: the tar header needs the size before the
+	// bytes, and several uploads at once should not each hold a whole file.
+	spool, err := os.CreateTemp("", "localimage-upload-*")
 	if err != nil {
 		return 0, err
 	}
-	if len(data) > maxUpload {
+	defer os.Remove(spool.Name())
+	defer spool.Close()
+	size, err := io.Copy(spool, io.LimitReader(r, maxUpload+1))
+	if err != nil {
+		return 0, err
+	}
+	if size > maxUpload {
 		return 0, fmt.Errorf("file exceeds %d MiB", maxUpload>>20)
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return 0, err
 	}
 	cid, err := m.containerOf(ctx, id)
 	if err != nil {
@@ -139,22 +151,24 @@ func (m *Manager) UploadFile(ctx context.Context, id, p string, r io.Reader) (in
 	} else if code != 0 {
 		return 0, fmt.Errorf("cannot create %s: %s", dir, bytes.TrimSpace(se))
 	}
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	hdr := &tar.Header{Name: path.Base(p), Mode: 0o644, Size: int64(len(data)), Uid: 1000, Gid: 1000}
-	if err := tw.WriteHeader(hdr); err != nil {
+	pr, pw := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(pw)
+		err := tw.WriteHeader(&tar.Header{Name: path.Base(p), Mode: 0o644, Size: size, Uid: 1000, Gid: 1000})
+		if err == nil {
+			_, err = io.Copy(tw, spool)
+		}
+		if err == nil {
+			err = tw.Close()
+		}
+		pw.CloseWithError(err)
+	}()
+	err = m.cli.CopyToContainer(ctx, cid, dir, pr, container.CopyToContainerOptions{})
+	pr.CloseWithError(err) // unblocks the writer if Docker stopped reading
+	if err != nil {
 		return 0, err
 	}
-	if _, err := tw.Write(data); err != nil {
-		return 0, err
-	}
-	if err := tw.Close(); err != nil {
-		return 0, err
-	}
-	if err := m.cli.CopyToContainer(ctx, cid, dir, &buf, container.CopyToContainerOptions{}); err != nil {
-		return 0, err
-	}
-	return int64(len(data)), nil
+	return size, nil
 }
 
 // DownloadFile streams the file at p to w.

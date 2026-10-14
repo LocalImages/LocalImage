@@ -7,6 +7,8 @@ from typing import Optional
 
 
 def _config_dir() -> str:
+    if os.environ.get("LOCALIMAGE_CONFIG_DIR"):
+        return os.environ["LOCALIMAGE_CONFIG_DIR"]
     home = os.path.expanduser("~")
     if sys.platform == "win32":
         return os.environ.get("AppData") or os.path.join(home, "AppData", "Roaming")
